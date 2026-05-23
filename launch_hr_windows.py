@@ -87,14 +87,38 @@ def _wait_for_port(port: int, timeout: float = 40.0) -> bool:
 _API_PORT = 8001
 _ST_PORT  = 8502
 
+# Shared state so main() can detect API failure
+_api_state: dict = {"failed": False, "error": ""}
+
+
 def _run_api_server():
-    """Start uvicorn in-process on port 8001."""
+    """
+    Start uvicorn in-process on port 8001.
+
+    log_config=None  — CRITICAL for frozen (PyInstaller) builds.
+    Uvicorn's default log config references formatter classes that are not
+    available in the frozen environment, causing:
+      'Unable to configure formatter default'
+    Passing None disables that config and lets Python's root logger handle output.
+    """
     try:
         import uvicorn
         from app.server.automation_server import app as fastapi_app
-        uvicorn.run(fastapi_app, host="127.0.0.1", port=_API_PORT, log_level="warning")
+
+        config = uvicorn.Config(
+            fastapi_app,
+            host="127.0.0.1",
+            port=_API_PORT,
+            log_level="error",
+            log_config=None,   # <-- fixes "Unable to configure formatter 'default'"
+        )
+        server = uvicorn.Server(config)
+        server.run()
     except Exception:
-        _log(f"[API] CRASHED:\n{traceback.format_exc()}")
+        err = traceback.format_exc()
+        _api_state["failed"] = True
+        _api_state["error"] = err
+        _log(f"[API] CRASHED:\n{err}")
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +180,17 @@ def main():
     api_thread.start()
 
     if not _wait_for_port(_API_PORT, timeout=20):
-        _log(f"WARNING: API server did not start within 20 s on port {_API_PORT}")
+        if _api_state["failed"]:
+            _log(f"ERROR: API server crashed on startup:\n{_api_state['error']}")
+            print()
+            print("=" * 60)
+            print("  ERROR: Automation server failed to start!")
+            print(f"  Reason: {_api_state['error'][:200]}")
+            print(f"  See full log: {_LOG_FILE}")
+            print("=" * 60)
+            input("Press Enter to exit.")
+            return
+        _log(f"WARNING: API server did not respond within 20 s on port {_API_PORT}")
     else:
         _log(f"API server ready on port {_API_PORT}")
 
