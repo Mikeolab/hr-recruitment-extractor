@@ -25,7 +25,7 @@ if os.path.exists("playwright_browsers"):
         for fname in files:
             src  = os.path.normpath(os.path.join(root, fname))
             rel  = os.path.relpath(src, "playwright_browsers")
-            dest = os.path.join("playwright_browsers", os.path.dirname(rel))
+            dest = os.path.join("playwright_browsers", rel)
             datas.append((src, dest))
 
 # ── Hidden imports ────────────────────────────────────────────────────────────
