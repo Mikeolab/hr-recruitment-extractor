@@ -2,17 +2,17 @@
 """
 Windows launcher for HR Recruitment Extractor.
 
-Starts:
-  1. FastAPI / uvicorn server  → port 8001  (automation_server.py)
-  2. Streamlit UI              → port 8502  (app/main.py)
-  3. Opens default browser to  http://localhost:8502
+How frozen-EXE Streamlit works (matches lead-extractor pattern):
+  1. Parent  : HRExtractor.exe  (no env STREAMLIT_CHILD)
+               → starts FastAPI thread
+               → spawns itself again as child with STREAMLIT_CHILD=1
+               → waits for port 8502, opens browser
+  2. Child   : HRExtractor.exe  (STREAMLIT_CHILD=1 in env)
+               → detects flag at __name__=="__main__"
+               → calls stcli.main() with correct sys.argv → Streamlit runs
 
-Works both as a plain Python script (.py) and as a frozen PyInstaller EXE.
-No licence checking, no PyWebview dependency — just the two servers.
-
-Logs:
-  %APPDATA%\\HRExtractor\\error.log
-  %APPDATA%\\HRExtractor\\streamlit_stderr.log
+Logs: %APPDATA%\HRExtractor\error.log
+      %APPDATA%\HRExtractor\streamlit_stderr.log
 """
 from __future__ import annotations
 
@@ -31,8 +31,7 @@ from pathlib import Path
 # Path setup (frozen EXE vs dev)
 # ---------------------------------------------------------------------------
 if getattr(sys, "frozen", False):
-    # Running as PyInstaller EXE — sys._MEIPASS is the temp extraction dir
-    BASE = Path(sys._MEIPASS)  # type: ignore[attr-defined]
+    BASE = Path(sys._MEIPASS)          # type: ignore[attr-defined]
 
     # Point Playwright at the bundled Chromium if present
     _bundled = BASE / "playwright_browsers"
@@ -44,6 +43,9 @@ else:
 
 sys.path.insert(0, str(BASE))
 
+_MAIN_SCRIPT = BASE / "app" / "main.py"
+
+
 # ---------------------------------------------------------------------------
 # Log directory
 # ---------------------------------------------------------------------------
@@ -52,8 +54,9 @@ _LOG_DIR.mkdir(parents=True, exist_ok=True)
 _LOG_FILE  = _LOG_DIR / "error.log"
 _ST_LOG    = _LOG_DIR / "streamlit_stderr.log"
 
+
 def _log(msg: str):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    ts   = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
     print(line, flush=True)
     try:
@@ -72,34 +75,29 @@ def _port_free(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) != 0
 
 
-def _wait_for_port(port: int, timeout: float = 40.0) -> bool:
+def _wait_for_port(port: int, timeout: float = 45.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if not _port_free(port):
             return True
-        time.sleep(0.4)
+        time.sleep(0.5)
     return False
 
 
 # ---------------------------------------------------------------------------
-# FastAPI server (uvicorn, runs in background thread)
+# FastAPI server (background thread)
 # ---------------------------------------------------------------------------
 _API_PORT = 8001
 _ST_PORT  = 8502
-
-# Shared state so main() can detect API failure
 _api_state: dict = {"failed": False, "error": ""}
 
 
 def _run_api_server():
     """
-    Start uvicorn in-process on port 8001.
-
-    log_config=None  — CRITICAL for frozen (PyInstaller) builds.
-    Uvicorn's default log config references formatter classes that are not
-    available in the frozen environment, causing:
-      'Unable to configure formatter default'
-    Passing None disables that config and lets Python's root logger handle output.
+    Start uvicorn in-process.
+    log_config=None  — prevents 'Unable to configure formatter default'
+    in frozen (PyInstaller) builds where uvicorn's default logging
+    config references missing formatter classes.
     """
     try:
         import uvicorn
@@ -110,163 +108,184 @@ def _run_api_server():
             host="127.0.0.1",
             port=_API_PORT,
             log_level="error",
-            log_config=None,   # <-- fixes "Unable to configure formatter 'default'"
+            log_config=None,
         )
         server = uvicorn.Server(config)
         server.run()
     except Exception:
         err = traceback.format_exc()
         _api_state["failed"] = True
-        _api_state["error"] = err
+        _api_state["error"]  = err
         _log(f"[API] CRASHED:\n{err}")
 
 
 # ---------------------------------------------------------------------------
 # Streamlit child process
 # ---------------------------------------------------------------------------
-def _streamlit_cmd() -> list[str]:
-    """Build the Streamlit command list."""
+def _spawn_streamlit() -> "subprocess.Popen[bytes]":
+    """
+    Spawn this same EXE (or Python in dev) as a child process with
+    STREAMLIT_CHILD=1 so the __main__ guard below routes it to stcli.main().
+    """
     if getattr(sys, "frozen", False):
-        # Frozen: run the bundled main.py through the frozen Python
-        main_py = str(BASE / "app" / "main.py")
-        return [
+        # Frozen: re-spawn ourselves; __main__ detects STREAMLIT_CHILD and runs stcli
+        cmd = [
             sys.executable,
-            "-m", "streamlit", "run",
-            main_py,
-            "--server.port", str(_ST_PORT),
-            "--server.headless", "true",
-            "--server.fileWatcherType", "none",
-            "--browser.gatherUsageStats", "false",
-            "--logger.level", "warning",
+            "streamlit", "run", str(_MAIN_SCRIPT),
+            f"--server.port={_ST_PORT}",
+            "--server.address=127.0.0.1",
+            "--server.headless=true",
+            "--server.fileWatcherType=none",
+            "--browser.gatherUsageStats=false",
+            "--server.enableCORS=false",
+            "--server.enableXsrfProtection=false",
+            "--server.runOnSave=false",
+            "--global.developmentMode=false",
         ]
     else:
-        # Dev: use the venv Python directly
-        venv_python = str(BASE / ".venv" / "Scripts" / "python.exe")
-        if not Path(venv_python).exists():
-            venv_python = sys.executable
-        return [
-            venv_python,
-            "-m", "streamlit", "run",
-            str(BASE / "app" / "main.py"),
-            "--server.port", str(_ST_PORT),
-            "--server.headless", "true",
-            "--server.fileWatcherType", "none",
-            "--browser.gatherUsageStats", "false",
-            "--logger.level", "warning",
+        # Dev: use the venv Python with -m streamlit
+        venv_py = BASE / ".venv" / "Scripts" / "python.exe"
+        py = str(venv_py) if venv_py.exists() else sys.executable
+        cmd = [
+            py, "-m", "streamlit", "run", str(_MAIN_SCRIPT),
+            f"--server.port={_ST_PORT}",
+            "--server.address=127.0.0.1",
+            "--server.headless=true",
+            "--server.fileWatcherType=none",
+            "--browser.gatherUsageStats=false",
         ]
 
+    env = os.environ.copy()
+    env["PYTHONPATH"]      = str(BASE)
+    env["STREAMLIT_CHILD"] = "1"
+    env["AUTOMATION_SERVER_URL"] = f"http://localhost:{_API_PORT}"
+    env["WEBSOCKET_URL"]         = f"ws://localhost:{_API_PORT}/ws"
+
+    # Truncate previous stderr log
+    try:
+        with open(_ST_LOG, "w", encoding="utf-8") as f:
+            f.write(f"# streamlit_stderr.log {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    except Exception:
+        pass
+
+    stderr_fh = open(_ST_LOG, "a", encoding="utf-8", errors="replace")
+
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=stderr_fh,
+        cwd=str(BASE),
+        env=env,
+        creationflags=creationflags,
+    )
+    return proc
+
+
+def _tail_log(path: Path, max_chars: int = 2000) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()[-max_chars:]
+    except Exception:
+        return ""
+
 
 # ---------------------------------------------------------------------------
-# Main
+# Main launcher logic
 # ---------------------------------------------------------------------------
-def main():
+def _main():
     _log("=" * 60)
-    _log("HR Recruitment Extractor — starting")
-    _log(f"BASE path: {BASE}")
-    _log(f"Log dir:   {_LOG_DIR}")
+    _log("HR Recruitment Extractor starting")
+    _log(f"BASE : {BASE}")
+    _log(f"Logs : {_LOG_DIR}")
 
-    # Check ports available
-    if not _port_free(_API_PORT):
-        _log(f"WARNING: port {_API_PORT} already in use — API server may be running already")
-    if not _port_free(_ST_PORT):
-        _log(f"WARNING: port {_ST_PORT} already in use — opening browser anyway")
-        webbrowser.open(f"http://localhost:{_ST_PORT}")
-        input("Press Enter to exit...")
-        return
-
-    # ── Start FastAPI in background thread ────────────────────────────────────
+    # ── Start FastAPI ────────────────────────────────────────────────────────
     _log(f"Starting API server on port {_API_PORT}...")
-    api_thread = threading.Thread(target=_run_api_server, daemon=True, name="api-server")
-    api_thread.start()
+    threading.Thread(target=_run_api_server, daemon=True, name="api-server").start()
 
     if not _wait_for_port(_API_PORT, timeout=20):
         if _api_state["failed"]:
-            _log(f"ERROR: API server crashed on startup:\n{_api_state['error']}")
-            print()
-            print("=" * 60)
-            print("  ERROR: Automation server failed to start!")
-            print(f"  Reason: {_api_state['error'][:200]}")
-            print(f"  See full log: {_LOG_FILE}")
-            print("=" * 60)
-            input("Press Enter to exit.")
-            return
-        _log(f"WARNING: API server did not respond within 20 s on port {_API_PORT}")
+            _log(f"ERROR: API server crashed: {_api_state['error'][:300]}")
+        else:
+            _log(f"WARNING: API server not ready after 20 s (may still be starting)")
     else:
         _log(f"API server ready on port {_API_PORT}")
 
-    # ── Start Streamlit as child process ─────────────────────────────────────
-    cmd = _streamlit_cmd()
-    _log(f"Starting Streamlit: {' '.join(cmd)}")
+    # ── Start Streamlit child ────────────────────────────────────────────────
+    _log(f"Spawning Streamlit child on port {_ST_PORT}...")
+    proc = _spawn_streamlit()
+    _log(f"Streamlit PID: {proc.pid}")
 
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(BASE)
-    env["AUTOMATION_SERVER_URL"] = f"http://localhost:{_API_PORT}"
-    env["WEBSOCKET_URL"] = f"ws://localhost:{_API_PORT}/ws"
-
-    st_log_handle = open(_ST_LOG, "w", encoding="utf-8")
-    st_proc = subprocess.Popen(
-        cmd,
-        env=env,
-        stdout=st_log_handle,
-        stderr=subprocess.STDOUT,
-        cwd=str(BASE),
-    )
-    _log(f"Streamlit PID: {st_proc.pid}")
-
-    # Wait for Streamlit to be ready
-    if not _wait_for_port(_ST_PORT, timeout=45):
-        _log("ERROR: Streamlit did not start within 45 s")
-        try:
-            with open(_ST_LOG, encoding="utf-8") as f:
-                tail = f.read()[-2000:]
-            _log(f"Streamlit stderr tail:\n{tail}")
-        except Exception:
-            pass
-        input("Streamlit failed to start. Press Enter to exit.")
-        st_proc.terminate()
+    if not _wait_for_port(_ST_PORT, timeout=60):
+        tail = _tail_log(_ST_LOG)
+        _log(f"ERROR: Streamlit did not start within 60 s\nStreamlit stderr:\n{tail or '(empty)'}")
+        print()
+        print("=" * 60)
+        print("  Streamlit failed to start.")
+        print(f"  See log: {_ST_LOG}")
+        if tail:
+            print(f"\n  Last output:\n{tail[-500:]}")
+        print("=" * 60)
+        input("Press Enter to exit.")
+        proc.terminate()
         return
 
     _log(f"Streamlit ready on port {_ST_PORT}")
 
-    # ── Open browser ──────────────────────────────────────────────────────────
+    # ── Open browser ─────────────────────────────────────────────────────────
     url = f"http://localhost:{_ST_PORT}"
-    _log(f"Opening browser: {url}")
-    # Small delay so Streamlit finishes initialising
-    time.sleep(1.2)
+    time.sleep(1.0)
     webbrowser.open(url)
+    _log(f"Browser opened: {url}")
 
     print()
     print("=" * 60)
     print("  HR Recruitment Extractor is running!")
-    print(f"  UI  → {url}")
-    print(f"  API → http://localhost:{_API_PORT}")
+    print(f"  UI  -> {url}")
+    print(f"  API -> http://localhost:{_API_PORT}")
     print()
     print("  Close this window (or press Ctrl+C) to stop.")
     print("=" * 60)
 
-    # ── Keep alive until Streamlit exits ─────────────────────────────────────
     try:
-        st_proc.wait()
+        proc.wait()
     except KeyboardInterrupt:
         _log("Ctrl+C — shutting down")
     finally:
-        _log("Terminating Streamlit...")
         try:
-            st_proc.terminate()
-            st_proc.wait(timeout=5)
+            proc.terminate()
+            proc.wait(timeout=5)
         except Exception:
             try:
-                st_proc.kill()
+                proc.kill()
             except Exception:
                 pass
-        st_log_handle.close()
         _log("Shutdown complete.")
 
 
+# ---------------------------------------------------------------------------
+# Entry point — STREAMLIT_CHILD detection MUST be first
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    # When frozen, the parent EXE re-spawns itself with STREAMLIT_CHILD=1 so
+    # the child becomes the Streamlit host. Detect that and short-circuit.
+    if getattr(sys, "frozen", False) and os.environ.get("STREAMLIT_CHILD") == "1":
+        os.chdir(str(BASE))
+        os.environ["PYTHONPATH"] = str(BASE)
+        # sys.argv from parent: [exe, "streamlit", "run", "app/main.py", ...]
+        # stcli.main() expects argv starting at "streamlit"
+        sys.argv = sys.argv[1:] if len(sys.argv) > 1 else ["streamlit", "run", str(_MAIN_SCRIPT)]
+        from streamlit.web import cli as stcli
+        stcli.main()
+        sys.exit(0)
+
+    # Normal parent launch
     try:
-        main()
+        _main()
     except Exception:
         _log(f"UNHANDLED CRASH:\n{traceback.format_exc()}")
-        input("Fatal error — see log. Press Enter to exit.")
+        input("Fatal error. Press Enter to exit.")
         sys.exit(1)
