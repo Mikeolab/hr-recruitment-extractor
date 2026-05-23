@@ -42,22 +42,20 @@ GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", "")
 # License
 LICENSE_KEY = os.getenv("LICENSE_KEY", "")
 
-# App settings (NEXUS rebrand)
-APP_NAME = "NEXUS — Lead Intelligence"
-BRAND_SHORT = "NEXUS"
-BRAND_TAGLINE = "Lead Intelligence"
-BRAND_GLYPH = "◉"
+# App settings
+APP_NAME = "HR Recruitment Extractor"
 APP_VERSION = "1.0.0"
+APP_SUBTITLE = "Find HR Decision Makers & Hiring Managers"
 MAX_RESULTS_PER_SEARCH = 100  # Google CSE max per query cycle
 DEFAULT_RESULTS = 10
 # Use user data directory for bundled app, project root for development
 if getattr(sys, 'frozen', False):
     # Bundled app - use user's Application Support
-    DATABASE_PATH = USER_DATA_DIR / "leads.db"
+    DATABASE_PATH = USER_DATA_DIR / "hr_leads.db"
     EXPORT_DIR = USER_DATA_DIR / "exports"
 else:
     # Development - use project directory
-    DATABASE_PATH = PROJECT_ROOT / "data" / "leads.db"
+    DATABASE_PATH = PROJECT_ROOT / "data" / "hr_leads.db"
     EXPORT_DIR = PROJECT_ROOT / "exports"
 
 # Scraper settings
@@ -69,18 +67,11 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# License secret — XOR-obfuscated so it is not a plain string in the binary.
-# Do NOT reconstruct this by hand; changes here invalidate all issued keys.
-_K = 0x5A
-_S = bytes([
-    0x36,0x3f,0x3b,0x3e,0x77,0x3f,0x22,0x2e,0x28,0x3b,0x39,0x2e,
-    0x35,0x28,0x77,0x2a,0x28,0x35,0x77,0x68,0x6a,0x68,0x6c,0x77,
-    0x29,0x3f,0x39,0x28,0x3f,0x2e,0x77,0x31,0x3f,0x23,
-])
-LICENSE_SECRET = "".join(chr(b ^ _K) for b in _S)
+# License secret (used for HMAC signing - keep this safe)
+LICENSE_SECRET = "lead-extractor-pro-2026-secret-key"
 
 # WebSocket / API URL for automation server (for cloud deployment)
 # Set AUTOMATION_SERVER_URL env (e.g. https://your-api.onrender.com) or leave default for localhost
-AUTOMATION_SERVER_URL = os.environ.get("AUTOMATION_SERVER_URL", "http://localhost:8000")
+AUTOMATION_SERVER_URL = os.environ.get("AUTOMATION_SERVER_URL", "http://localhost:8001")
 WEBSOCKET_URL = AUTOMATION_SERVER_URL.replace("http://", "ws://").replace("https://", "wss://").rstrip("/") + "/ws"
 

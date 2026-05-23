@@ -29,6 +29,28 @@ JUNK_DOMAINS = {
     "facebook.com",
     "twitter.com",
     "instagram.com",
+    # Search engines — their own emails appear in SERP pages
+    "duckduckgo.com",
+    "google.com",
+    "bing.com",
+    "yahoo.com",
+    "ask.com",
+    "baidu.com",
+    # CDN / infra domains that leak into scraped pages
+    "cloudflare.com",
+    "amazonaws.com",
+    "akamaihd.net",
+    "fastly.net",
+    "cdn.net",
+    # Job boards and social that shouldn't be treated as company emails
+    "linkedin.com",
+    "glassdoor.com",
+    "indeed.com",
+    "monster.com",
+    "ziprecruiter.com",
+    "reddit.com",
+    "quora.com",
+    "medium.com",
 }
 
 JUNK_PREFIXES = {

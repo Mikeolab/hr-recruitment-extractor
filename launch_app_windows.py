@@ -265,100 +265,17 @@ def show_native_info(title: str, message: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# License pre-flight (launcher-level, before WebView opens)
-# ─────────────────────────────────────────────────────────────────────────────
-def _preflight_license_check() -> bool:
-    """
-    Quick license sanity check using only stdlib sqlite3 + app modules.
-    Returns True if a valid, machine-bound license record exists in the DB.
-    Returns False (and shows a native warning) if the DB has no matching record.
-
-    This is a *first gate* — the Streamlit UI is the authoritative gate.
-    Its purpose is to block the WebView from opening on a clearly unlicensed machine
-    so the user sees a native dialog instead of a blank browser window.
-    """
-    try:
-        import sqlite3
-        db_path = USER_DATA_DIR / "leads.db"
-        if not db_path.exists():
-            _log("License pre-flight: DB not found — new installation, skip check.")
-            return True  # First run — Streamlit activation dialog will handle it
-
-        conn = sqlite3.connect(str(db_path), timeout=3)
-        cursor = conn.cursor()
-        # Check table exists
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='app_license'"
-        )
-        if not cursor.fetchone():
-            conn.close()
-            _log("License pre-flight: app_license table absent — first run.")
-            return True  # First run
-
-        cursor.execute(
-            "SELECT license_key, machine_id FROM app_license "
-            "WHERE is_active = 1 ORDER BY activated_at DESC LIMIT 1"
-        )
-        row = cursor.fetchone()
-        conn.close()
-
-        if not row or not row[0]:
-            _log("License pre-flight: no active license found.")
-            return False
-
-        license_key, stored_mid = row[0], (row[1] or "")
-        if not stored_mid:
-            _log("License pre-flight: license has no machine binding (legacy record).")
-            return False
-
-        # Compare machine ID
-        from app.license.machine_id import get_machine_id
-        current_mid = get_machine_id()
-        if stored_mid.lower() != current_mid.lower():
-            _log(f"License pre-flight: machine mismatch. stored={stored_mid} current={current_mid}")
-            return False
-
-        # Verify HMAC + expiry via the proper validator
-        from app.config import LICENSE_SECRET
-        from app.license.validator import validate_license
-        info = validate_license(license_key, LICENSE_SECRET)
-        if not info.valid:
-            _log(f"License pre-flight: validation failed — {info.error}")
-            return False
-
-        _log("License pre-flight: OK.")
-        return True
-
-    except Exception as e:
-        _log(f"License pre-flight error (allowing startup): {e}")
-        return True  # On unexpected error let Streamlit handle it
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # FastAPI server (background thread)
 # ─────────────────────────────────────────────────────────────────────────────
 def start_fastapi_server(port: int) -> bool:
     """Start uvicorn on (127.0.0.1, port) in a daemon thread. Returns True once
     the port accepts connections, False on import/bind/startup failure."""
     try:
-        # Pre-configure logging to avoid formatter issues in frozen app
-        import logging
-        logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
-        logging.getLogger("uvicorn.access").setLevel(logging.CRITICAL)
-        logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
-        logging.getLogger("fastapi").setLevel(logging.CRITICAL)
-        
         import uvicorn
         from app.server.automation_server import app as fastapi_app
 
         config = uvicorn.Config(
-            fastapi_app,
-            host="127.0.0.1",
-            port=port,
-            log_level="critical",  # Only log critical errors
-            log_config=None,  # Disable uvicorn's logging config (fixes frozen app formatter issue)
-            use_colors=False,  # Disable ANSI colors (no terminal in frozen app)
-            access_log=False,  # Disable access logging
+            fastapi_app, host="127.0.0.1", port=port, log_level="error"
         )
         server = uvicorn.Server(config)
 
@@ -632,28 +549,6 @@ def main() -> None:
                 f"{SHARED_STATE['streamlit_error'][:1200]}",
             )
             release_lock(lock_fd)
-            sys.exit(1)
-
-        # ── License pre-flight ───────────────────────────────────────────────
-        # Check BEFORE opening the window. On a fresh install (no DB yet) this
-        # returns True so the activation dialog inside Streamlit can handle it.
-        # On a machine where the license is missing or bound to a different PC,
-        # we show a native dialog and exit cleanly.
-        if not _preflight_license_check():
-            from app.license.machine_id import get_machine_id as _gmid
-            _mid = _gmid()
-            show_native_error(
-                "Lead Extractor Pro — License Required",
-                "No valid license found for this computer.\n\n"
-                f"Your Hardware ID:\n  {_mid}\n\n"
-                "Send this ID to your administrator to obtain a license key.\n"
-                "Then relaunch the application and enter the key when prompted.",
-            )
-            release_lock(lock_fd)
-            try:
-                proc.terminate()
-            except Exception:
-                pass
             sys.exit(1)
 
         # ── Open the UI ─────────────────────────────────────────────────────

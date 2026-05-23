@@ -154,6 +154,73 @@ def save_leads(search_id: int, leads: list[dict], replace: bool = False) -> int:
     return count
 
 
+def get_leads_without_email(search_id: int | None = None) -> list[dict]:
+    """
+    Return all leads that have no email address, optionally filtered by search_id.
+    Each dict includes the lead 'id' field so it can be updated later.
+    """
+    conn = get_connection()
+    if search_id is not None:
+        rows = conn.execute(
+            """SELECT id, search_id, business_name, contact_name, email, phone,
+                      website, source_url, snippet
+               FROM leads
+               WHERE (email IS NULL OR email = '') AND search_id = ?""",
+            (search_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT id, search_id, business_name, contact_name, email, phone,
+                      website, source_url, snippet
+               FROM leads
+               WHERE (email IS NULL OR email = '')""",
+        ).fetchall()
+    conn.close()
+    keys = ["id", "search_id", "business_name", "contact_name", "email",
+            "phone", "website", "source_url", "snippet"]
+    return [dict(zip(keys, row)) for row in rows]
+
+
+def update_lead_email(
+    lead_id: int,
+    email: str,
+    verified_status: str,
+    confidence: float,
+    source: str,
+) -> None:
+    """
+    Update a lead's email address and write enrichment metadata to hr_lead_enrichment.
+
+    verified_status: "valid" | "found_on_site" | "catchall" | "unverifiable" | "unknown"
+    confidence:      float 0.0–1.0
+    source:          how the email was found (e.g. "smtp_pattern_3", "scraped_name_match")
+    """
+    from datetime import datetime
+
+    conn = get_connection()
+    # Update the email on the lead itself
+    conn.execute(
+        "UPDATE leads SET email = ? WHERE id = ?",
+        (email, lead_id),
+    )
+    # Upsert into hr_lead_enrichment
+    is_verified = 1 if verified_status == "valid" else 0
+    notes = f"status={verified_status} confidence={confidence:.2f} source={source}"
+    conn.execute(
+        """INSERT INTO hr_lead_enrichment
+               (lead_id, verified_email, last_enriched_at, data_source, enrichment_notes)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(lead_id) DO UPDATE SET
+               verified_email    = excluded.verified_email,
+               last_enriched_at  = excluded.last_enriched_at,
+               data_source       = excluded.data_source,
+               enrichment_notes  = excluded.enrichment_notes""",
+        (lead_id, is_verified, datetime.utcnow().isoformat(), source, notes),
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_recent_searches(limit: int = 20) -> list[dict]:
     """Get recent search history."""
     if _use_postgres and _db:

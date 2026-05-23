@@ -1,0 +1,87 @@
+# Build HRExtractor.exe for Windows
+# Triggers on every push to main, or manually via "Run workflow"
+# Download the artifact from the Actions → run → Artifacts section
+
+name: Build HR Extractor (Windows EXE)
+
+on:
+  push:
+    branches: [main, master, hr-extractor]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Python ──────────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── Dependencies ────────────────────────────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      # ── Playwright browser ───────────────────────────────────────────────────
+      # Download Chromium into playwright_browsers/ so PyInstaller bundles it.
+      - name: Install Playwright + Chromium
+        run: |
+          python -m playwright install chromium
+          python -m playwright install-deps chromium
+
+      # Copy Playwright's Chromium cache into playwright_browsers/ at repo root
+      # so the spec file can walk and bundle the directory.
+      - name: Copy Playwright Chromium to playwright_browsers/
+        shell: python
+        run: |
+          import os, shutil, pathlib
+
+          # Playwright stores browsers in %LOCALAPPDATA%\ms-playwright on Windows
+          cache = pathlib.Path(os.environ["LOCALAPPDATA"]) / "ms-playwright"
+          dest  = pathlib.Path("playwright_browsers")
+
+          if not cache.exists():
+              print(f"Cache not found at {cache} — skipping copy")
+          else:
+              print(f"Copying {cache} → {dest}")
+              if dest.exists():
+                  shutil.rmtree(dest)
+              shutil.copytree(cache, dest, symlinks=False)
+              total = sum(1 for _ in dest.rglob("*"))
+              print(f"Copied {total} items")
+
+      # ── PyInstaller build ────────────────────────────────────────────────────
+      - name: Build HRExtractor.exe
+        run: |
+          python -m PyInstaller --clean --noconfirm HRExtractor_windows.spec
+
+      # ── Sanity check ────────────────────────────────────────────────────────
+      - name: Verify EXE exists
+        shell: python
+        run: |
+          import pathlib, sys
+          exe = pathlib.Path("dist/HRExtractor.exe")
+          if not exe.exists():
+              print("ERROR: dist/HRExtractor.exe not found!")
+              sys.exit(1)
+          size_mb = exe.stat().st_size / 1_048_576
+          print(f"OK: HRExtractor.exe — {size_mb:.1f} MB")
+
+      # ── Upload artifact ──────────────────────────────────────────────────────
+      - name: Upload HRExtractor.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: HRExtractor-Windows
+          path: dist/HRExtractor.exe
+          retention-days: 30
+          if-no-files-found: error

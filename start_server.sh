@@ -2,8 +2,8 @@
 # Start FastAPI in background, Streamlit in foreground (for cloud deployment)
 set -e
 
-echo "Starting automation server on port 8000..."
-uvicorn app.server.automation_server:app --host 0.0.0.0 --port 8000 &
+echo "Starting automation server on port 8001..."
+uvicorn app.server.automation_server:app --host 0.0.0.0 --port 8001 &
 UVICORN_PID=$!
 
 echo "Waiting for API to be ready..."

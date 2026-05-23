@@ -7,9 +7,11 @@ from __future__ import annotations
 import asyncio
 import json
 import base64
+import re
 import time
 import io
 import os
+import random
 import sys
 import subprocess
 from pathlib import Path
@@ -105,14 +107,92 @@ def _url_is_reddit_thread_like(href: str) -> bool:
         return False
 
 
+_SKIP_DOMAINS: frozenset = frozenset({
+    # Social media — no useful contact info in source
+    "twitter.com", "x.com", "facebook.com", "instagram.com", "tiktok.com",
+    "snapchat.com", "pinterest.com", "youtube.com", "vimeo.com", "twitch.tv",
+    # Encyclopedias / aggregators
+    "wikipedia.org", "wikimedia.org", "wikidata.org", "dbpedia.org",
+    # Job boards (we want the company, not the listing site)
+    "indeed.com", "glassdoor.com", "monster.com", "ziprecruiter.com",
+    "careerbuilder.com", "simplyhired.com", "dice.com", "hired.com",
+    "builtin.com", "wellfound.com", "angellist.com", "jobvite.com",
+    # LinkedIn full pages (profiles handled above via /in/ path)
+    "linkedin.com",
+    # Search engines / aggregators
+    "google.com", "bing.com", "duckduckgo.com", "yahoo.com", "ask.com",
+    # General noise
+    "reddit.com", "quora.com", "medium.com", "substack.com",
+    "amazon.com", "ebay.com", "etsy.com", "walmart.com",
+    "yelp.com", "tripadvisor.com", "yellowpages.com",
+})
+
+# URL path fragments that strongly suggest a contact/people/team page
+_CONTACT_PATH_HINTS: tuple = (
+    "/contact", "/team", "/about", "/people", "/staff", "/directory",
+    "/members", "/leadership", "/board", "/faculty", "/management",
+    "/executives", "/about-us", "/our-team", "/meet-the-team",
+    "/who-we-are", "/recruitment", "/human-resources", "/hr",
+    "/careers/contact", "/talent", "/our-people", "/partners",
+    "/advisory", "/speakers", "/attendees",
+)
+
+
 def _classify_ddg_serp_href(href: str, html_first_mode: bool) -> Optional[Literal["pdf", "html"]]:
-    """How to handle a DuckDuckGo result URL. None = skip."""
+    """
+    How to handle a DuckDuckGo result URL.
+    Returns: "pdf" | "html" | None (skip)
+
+    Strategy:
+    - Direct .pdf links → "pdf"
+    - LinkedIn /in/ profiles → "html" (snippet extraction, no page visit)
+    - Known-junk domains (social media, job boards) → None (skip)
+    - Pages with contact/team/people URL patterns → "html"
+    - html_first_mode → "html" for all remaining pages
+    - Everything else → None (skip in PDF-focused mode)
+    """
+    if not href:
+        return None
     path_lower = (href.split("?")[0] if "?" in href else href).lower()
+
+    # 1. Direct PDF links — highest priority
     if path_lower.endswith(".pdf"):
         return "pdf"
+    # Also catch PDF served via query string (e.g. ?format=pdf, ?type=pdf)
+    href_lower = href.lower()
+    if href_lower.endswith(".pdf") or "type=pdf" in href_lower or "format=pdf" in href_lower:
+        return "pdf"
+
+    # 2. LinkedIn profile pages → snippet-based HTML extraction (no page visit needed)
+    if "linkedin.com/in/" in path_lower:
+        return "html"
+
+    # 3. Reddit threads (html_first_mode only)
     if html_first_mode and _url_is_reddit_thread_like(href):
         return "html"
-    return None
+
+    # 4. Skip known-junk domains
+    try:
+        host = urlparse(href).netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+    except Exception:
+        host = ""
+
+    if any(host == d or host.endswith("." + d) for d in _SKIP_DOMAINS):
+        return None
+
+    # 5. Contact/team/people pages → definitely process as HTML
+    if any(hint in path_lower for hint in _CONTACT_PATH_HINTS):
+        return "html"
+
+    # 6. html_first_mode: process all remaining non-junk pages
+    if html_first_mode:
+        return "html"
+
+    # 7. PDF-focused mode: also process HTML pages (company sites, directories)
+    #    extract_from_html handles pages with no emails gracefully (returns [])
+    return "html"
 
 
 # Package root on path, then pdfplumber + extractors
@@ -128,7 +208,8 @@ import pdfplumber
 from app.extractors.email_extractor import extract_emails
 from app.extractors.name_extractor import extract_contact_names, extract_names_from_email
 from app.extractors.phone_extractor import extract_phones
-from app.database.db import save_search, save_leads
+from app.extractors.hr_title_extractor import extract_title, extract_company_info
+from app.database.db import save_search, save_leads, get_leads_without_email, update_lead_email
 from app.filters.email_domain_rules import (
     apply_site_restriction_to_query,
     filter_leads_by_email_domains,
@@ -168,6 +249,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# LinkedIn session persistence paths
+_DATA_DIR = Path(__file__).parent.parent.parent / "data"
+_LINKEDIN_CREDS_FILE = _DATA_DIR / "linkedin_creds.json"
+_LINKEDIN_SESSION_FILE = _DATA_DIR / "linkedin_session.json"
+
 
 class AutomationManager:
     """Manages Playwright browser automation and WebSocket connections."""
@@ -181,7 +267,7 @@ class AutomationManager:
         self.playwright = None
         self.is_running = False
         self.stop_flag = False
-        self.task = None  # asyncio Task for run_automation — stored so Stop can cancel it
+        self._intentional_close = False  # Set True before shutdown so on_browser_disconnected ignores it
         self.last_screenshot_time = 0
         self.screenshot_throttle = 1.0  # Max 1 screenshot per second
         self.all_leads_buffer = []  # Buffer to save on disconnect
@@ -200,6 +286,8 @@ class AutomationManager:
         Close page, browser context, browser, and Playwright so the OS window exits.
         Safe to call multiple times (e.g. Stop button + run_automation finally).
         """
+        # Signal the on_browser_disconnected callback not to treat this as an unexpected crash
+        self._intentional_close = True
         warnings: list[str] = []
         try:
             if self.page:
@@ -234,6 +322,23 @@ class AutomationManager:
                 self.playwright = None
         except Exception as e:
             warnings.append(f"shutdown:{str(e)[:50]}")
+
+        # macOS fallback: if Playwright's bundled Chromium window is still open after
+        # graceful close (crash, force-stop), kill it by its distinctive install path.
+        # We deliberately do NOT kill "Google Chrome" — that would close the user's browser.
+        import subprocess, platform
+        if platform.system() == "Darwin":
+            try:
+                # "ms-playwright" only appears in Playwright's own Chromium install path,
+                # never in the user's system Chrome process.
+                subprocess.run(
+                    ["pkill", "-f", "ms-playwright"],
+                    capture_output=True, timeout=3
+                )
+            except Exception:
+                pass
+
+        self._intentional_close = False  # Reset for next run
         return warnings
 
     async def broadcast(self, message: dict):
@@ -335,22 +440,22 @@ class AutomationManager:
                         "message": f"  📖 PDF has {total_pages} page(s), extracting text...",
                     })
                     
-                    # Extract from ALL pages (not just first page)
-                    for page_num, page in enumerate(pdf.pages[:100]):  # Max 100 pages
+                    # Extract from ALL pages (max 100) — only log every 10 pages to reduce noise
+                    pages_with_text = 0
+                    for page_num, page in enumerate(pdf.pages[:100]):
                         try:
                             page_text = page.extract_text()
                             if page_text:
                                 text_parts.append(page_text)
-                                await self.broadcast({
-                                    "type": "status",
-                                    "message": f"  📄 Extracted text from page {page_num + 1}/{total_pages} ({len(page_text)} chars)",
-                                })
+                                pages_with_text += 1
+                                # Log every 10 pages or the last page to avoid log spam
+                                if (page_num + 1) % 10 == 0 or (page_num + 1) == total_pages:
+                                    await self.broadcast({
+                                        "type": "status",
+                                        "message": f"  📄 Pages {page_num + 1}/{min(total_pages, 100)} scanned ({pages_with_text} with text)...",
+                                    })
                         except Exception as e:
-                            await self.broadcast({
-                                "type": "status",
-                                "message": f"  ⚠️ Page {page_num + 1} extraction error: {str(e)[:40]}",
-                            })
-                            continue
+                            pass  # Silently skip bad pages — don't flood log with errors
             except Exception as e:
                 await self.broadcast({
                     "type": "status",
@@ -394,50 +499,59 @@ class AutomationManager:
                     if derived:
                         names.append(derived)
 
-            # Create lead entries - ONLY name, phone, email
+            # Run HR title/company enrichment on the full PDF text once
+            hr_info = extract_title(pdf_text)
+            company_info = extract_company_info(pdf_text)
+
+            # Create lead entries
             if emails:
-                # Create one lead per email
                 for j, email in enumerate(emails):
                     cn = names[j] if j < len(names) else (names[0] if names else "")
                     ph = phones[j] if j < len(phones) else (phones[0] if phones else "")
+                    # Try to derive name from email if still missing
+                    if not cn:
+                        cn = extract_names_from_email(email)
                     leads.append({
                         "email": email,
                         "phone": ph,
                         "contact_name": cn,
-                        # Minimal fields for database compatibility
-                        "business_name": "",
+                        "business_name": company_info.get("company_name") or "",
                         "website": "",
                         "source_url": pdf_url,
-                        "snippet": "",
+                        "snippet": f"PDF: {title[:80]}",
+                        # HR classification fields
+                        "job_title": hr_info.get("title") or "",
+                        "seniority_level": hr_info.get("seniority") or "",
+                        "department": hr_info.get("department") or "",
+                        "is_hiring_role": hr_info.get("is_hiring_role", False),
                     })
                 await self.broadcast({
                     "type": "status",
-                    "message": f"  ✅ Created {len(leads)} lead(s) from PDF",
+                    "message": f"  ✅ {len(leads)} lead(s) from PDF"
+                    + (f" | title: {hr_info['title']}" if hr_info.get('title') else ""),
                 })
             elif phones or names:
-                # Include even without email (at least phone or name)
                 leads.append({
                     "email": "",
                     "phone": phones[0] if phones else "",
                     "contact_name": names[0] if names else "",
-                    "business_name": "",
+                    "business_name": company_info.get("company_name") or "",
                     "website": "",
                     "source_url": pdf_url,
-                    "snippet": "",
+                    "snippet": f"PDF: {title[:80]}",
+                    "job_title": hr_info.get("title") or "",
+                    "seniority_level": hr_info.get("seniority") or "",
+                    "department": hr_info.get("department") or "",
+                    "is_hiring_role": hr_info.get("is_hiring_role", False),
                 })
                 await self.broadcast({
                     "type": "status",
-                    "message": f"  ✅ Created 1 lead (phone/name only) from PDF",
+                    "message": "  ✅ 1 lead (name/phone only) from PDF — will enrich email in Phase 2",
                 })
             else:
                 await self.broadcast({
                     "type": "status",
-                    "message": f"  ⚠️ No emails/phones/names found in PDF text",
-                })
-                # Debug: show first 200 chars of text
-                await self.broadcast({
-                    "type": "status",
-                    "message": f"  🔍 PDF text sample: {pdf_text[:200]}...",
+                    "message": f"  ⚠️ No contacts found in PDF (text sample: {pdf_text[:120].strip()!r})",
                 })
 
         except Exception as e:
@@ -449,7 +563,7 @@ class AutomationManager:
         return leads
 
     async def extract_from_html(self, page_url: str, title: str, display_link: str) -> List[Dict]:
-        """Download HTML (e.g. Reddit thread), visible text, same lead fields as PDF path."""
+        """Download HTML page (contact page, team page, company site), extract emails/phones/names."""
         leads: List[Dict] = []
         try:
             await self.broadcast({
@@ -457,8 +571,11 @@ class AutomationManager:
                 "message": f"  📥 Fetching page: {title[:50]}...",
             })
             html_text = ""
+            page_domain = ""
+            company_name_from_page = ""
+            website_from_page = ""
             try:
-                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
                     response = await client.get(page_url, headers=_HTML_FETCH_HEADERS)
                     if response.status_code != 200:
                         await self.broadcast({
@@ -468,11 +585,45 @@ class AutomationManager:
                         return leads
                     raw = response.text or ""
                     soup = BeautifulSoup(raw, "lxml")
+                    # Extract page title / og:site_name for business_name
+                    try:
+                        og_site = soup.find("meta", property="og:site_name")
+                        if og_site and og_site.get("content"):
+                            company_name_from_page = og_site["content"].strip()
+                        if not company_name_from_page:
+                            pg_title = soup.find("title")
+                            if pg_title and pg_title.text:
+                                # "Contact Us | Acme Corp" → take last part after last | or -
+                                parts = re.split(r"\s*[\|–\-—]\s*", pg_title.text.strip())
+                                company_name_from_page = parts[-1].strip() if parts else ""
+                    except Exception:
+                        pass
+                    # Extract canonical domain for website field
+                    try:
+                        parsed_url = urlparse(str(response.url))
+                        page_domain = parsed_url.netloc.lstrip("www.")
+                        website_from_page = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                    except Exception:
+                        pass
+                    # Also grab mailto: links directly from HTML (most reliable email source)
+                    mailto_emails = []
+                    try:
+                        for a_tag in soup.find_all("a", href=True):
+                            href_val = a_tag.get("href", "")
+                            if href_val.startswith("mailto:"):
+                                email_val = href_val[7:].split("?")[0].strip().lower()
+                                if email_val and "@" in email_val:
+                                    mailto_emails.append(email_val)
+                    except Exception:
+                        pass
                     for tag in soup(["script", "style", "noscript"]):
                         tag.decompose()
                     html_text = soup.get_text(separator="\n", strip=True)
+                    # Prepend mailto emails so extractor sees them first
+                    if mailto_emails:
+                        html_text = "\n".join(mailto_emails) + "\n" + html_text
             except httpx.TimeoutException:
-                await self.broadcast({"type": "status", "message": "  ❌ Page download timeout"})
+                await self.broadcast({"type": "status", "message": "  ❌ Page download timeout (20s)"})
                 return leads
             except Exception as e:
                 await self.broadcast({
@@ -484,17 +635,13 @@ class AutomationManager:
             if not html_text or len(html_text.strip()) < 10:
                 await self.broadcast({
                     "type": "status",
-                    "message": "  ⚠️ No usable text on page (blocked, login wall, or empty)",
+                    "message": "  ⚠️ No usable text (blocked, login wall, or empty page)",
                 })
                 return leads
 
             await self.broadcast({
                 "type": "status",
-                "message": f"  ✅ Extracted {len(html_text)} chars from page",
-            })
-            await self.broadcast({
-                "type": "status",
-                "message": "  🔍 Searching for emails, phones, names...",
+                "message": f"  🔍 Scanning {len(html_text):,} chars — looking for emails, phones, names...",
             })
 
             emails = extract_emails(html_text, "")
@@ -505,6 +652,9 @@ class AutomationManager:
                 "type": "status",
                 "message": f"  📊 Found: {len(emails)} emails, {len(phones)} phones, {len(names)} names",
             })
+
+            # Run HR title extraction on page text to populate HR fields
+            hr_info = extract_title(html_text)
 
             if emails and not names:
                 for email in emails:
@@ -520,33 +670,41 @@ class AutomationManager:
                         "email": email,
                         "phone": ph,
                         "contact_name": cn,
-                        "business_name": "",
-                        "website": "",
+                        "business_name": company_name_from_page,
+                        "website": website_from_page or display_link,
                         "source_url": page_url,
-                        "snippet": "",
+                        "snippet": f"Extracted from {page_domain or display_link}",
+                        "job_title": hr_info.get("title") or "",
+                        "seniority_level": hr_info.get("seniority") or "",
+                        "department": hr_info.get("department") or "",
+                        "is_hiring_role": hr_info.get("is_hiring_role", False),
                     })
                 await self.broadcast({
                     "type": "status",
-                    "message": f"  ✅ Created {len(leads)} lead(s) from page",
+                    "message": f"  ✅ {len(leads)} lead(s) found on page" + (f" — {company_name_from_page}" if company_name_from_page else ""),
                 })
             elif phones or names:
                 leads.append({
                     "email": "",
                     "phone": phones[0] if phones else "",
                     "contact_name": names[0] if names else "",
-                    "business_name": "",
-                    "website": "",
+                    "business_name": company_name_from_page,
+                    "website": website_from_page or display_link,
                     "source_url": page_url,
-                    "snippet": "",
+                    "snippet": f"Extracted from {page_domain or display_link}",
+                    "job_title": hr_info.get("title") or "",
+                    "seniority_level": hr_info.get("seniority") or "",
+                    "department": hr_info.get("department") or "",
+                    "is_hiring_role": hr_info.get("is_hiring_role", False),
                 })
                 await self.broadcast({
                     "type": "status",
-                    "message": "  ✅ Created 1 lead (phone/name only) from page",
+                    "message": "  ✅ 1 lead (phone/name only) — will enrich email in Phase 2",
                 })
             else:
                 await self.broadcast({
                     "type": "status",
-                    "message": "  ⚠️ No emails/phones/names in page text",
+                    "message": "  ⚠️ No contacts found on this page",
                 })
         except Exception as e:
             await self.broadcast({
@@ -554,6 +712,417 @@ class AutomationManager:
                 "message": f"  ❌ HTML extraction error: {str(e)[:60]}",
             })
         return leads
+
+    async def extract_from_linkedin_snippet(
+        self, url: str, title: str, snippet: str, display_link: str
+    ) -> List[Dict]:
+        """
+        Extract lead data from a LinkedIn search-result title + snippet without visiting the page.
+
+        LinkedIn blocks headless scrapers and requires login for full profile access.
+        The SERP snippet is usually enough: it contains the person's name, job title,
+        company, and occasionally their public email address.
+
+        Title format DDG returns: "Name - Job Title at Company | LinkedIn"
+        """
+        import re
+        leads: List[Dict] = []
+        try:
+            name = ""
+            job_title = ""
+            company = ""
+
+            # Strip "| LinkedIn" suffix
+            title_clean = re.sub(r"\s*\|?\s*LinkedIn\s*$", "", title, flags=re.IGNORECASE).strip()
+
+            # Pattern: "Name - Title at Company"
+            m = re.match(
+                r"^(.+?)\s*[-–]\s*(.+?)\s+(?:at|@|·)\s+(.+)$", title_clean, re.IGNORECASE
+            )
+            if m:
+                name = m.group(1).strip()
+                job_title = m.group(2).strip()
+                company = m.group(3).strip()
+            else:
+                # Pattern: "Name - Title"
+                m2 = re.match(r"^(.+?)\s*[-–]\s*(.+)$", title_clean)
+                if m2:
+                    name = m2.group(1).strip()
+                    job_title = m2.group(2).strip()
+                else:
+                    name = title_clean
+
+            # Try to find email/phone in snippet (sometimes public profiles include them)
+            full_text = f"{title_clean} {snippet}"
+            emails = extract_emails(full_text, "")
+            phones = extract_phones(full_text, "")
+
+            # Only build a lead if we got at least a name or email
+            if name or emails:
+                lead = {
+                    "email": emails[0] if emails else "",
+                    "phone": phones[0] if phones else "",
+                    "contact_name": name,
+                    "business_name": company,
+                    "job_title": job_title,
+                    "website": "https://linkedin.com",
+                    "source_url": url,
+                    "snippet": snippet[:300] if snippet else "",
+                }
+                leads.append(lead)
+                await self.broadcast({
+                    "type": "status",
+                    "message": (
+                        f"  🔗 LinkedIn: {name or '?'}"
+                        + (f" — {job_title}" if job_title else "")
+                        + (f" @ {company}" if company else "")
+                        + (f" ✉ {emails[0]}" if emails else "")
+                    ),
+                })
+            else:
+                await self.broadcast({
+                    "type": "status",
+                    "message": f"  ⚠️ LinkedIn snippet yielded no usable data: {title[:60]}",
+                })
+        except Exception as e:
+            await self.broadcast({
+                "type": "status",
+                "message": f"  ❌ LinkedIn snippet error: {str(e)[:60]}",
+            })
+        return leads
+
+    # ─── LinkedIn Direct mode ──────────────────────────────────────────────────
+
+    async def _linkedin_load_session(self):
+        """Restore saved LinkedIn cookies into the current browser context."""
+        if _LINKEDIN_SESSION_FILE.exists():
+            try:
+                cookies = json.loads(_LINKEDIN_SESSION_FILE.read_text())
+                await self._context.add_cookies(cookies)
+                return True
+            except Exception:
+                pass
+        return False
+
+    async def _linkedin_save_session(self):
+        """Persist current LinkedIn cookies to disk for next run."""
+        try:
+            cookies = await self._context.cookies(["https://www.linkedin.com"])
+            _DATA_DIR.mkdir(exist_ok=True)
+            _LINKEDIN_SESSION_FILE.write_text(json.dumps(cookies))
+        except Exception:
+            pass
+
+    async def _linkedin_is_logged_in(self):
+        """Return True if the current page/session is authenticated on LinkedIn."""
+        try:
+            await self.page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=20000)
+            await asyncio.sleep(1.5)
+            url = self.page.url
+            return "feed" in url or "mynetwork" in url or "jobs" in url
+        except Exception:
+            return False
+
+    async def _linkedin_login(self):
+        """Log in to LinkedIn using credentials stored in data/linkedin_creds.json."""
+        if not _LINKEDIN_CREDS_FILE.exists():
+            await self.broadcast({"type": "status", "message": "❌ LinkedIn credentials not configured — add them in ⚙️ Settings tab."})
+            return False
+
+        creds = json.loads(_LINKEDIN_CREDS_FILE.read_text())
+        email = creds.get("email", "").strip()
+        password = creds.get("password", "").strip()
+        if not email or not password:
+            await self.broadcast({"type": "status", "message": "❌ LinkedIn email or password is empty — check ⚙️ Settings."})
+            return False
+
+        await self.broadcast({"type": "status", "message": "🔐 Logging into LinkedIn..."})
+        await self.page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded", timeout=20000)
+        await asyncio.sleep(1 + random.random() * 0.5)
+
+        try:
+            await self.page.fill("#username", email)
+            await asyncio.sleep(0.3 + random.random() * 0.4)
+            await self.page.fill("#password", password)
+            await asyncio.sleep(0.3 + random.random() * 0.3)
+            await self.page.click('[type="submit"]')
+            await self.page.wait_for_load_state("domcontentloaded", timeout=25000)
+            await asyncio.sleep(2.5)
+        except Exception as e:
+            await self.broadcast({"type": "status", "message": f"❌ Login interaction failed: {str(e)[:60]}"})
+            return False
+
+        url = self.page.url
+        if "feed" in url or "mynetwork" in url or "jobs" in url:
+            await self._linkedin_save_session()
+            await self.broadcast({"type": "status", "message": "✅ LinkedIn login successful — session saved"})
+            return True
+
+        if any(x in url for x in ["checkpoint", "challenge", "verify", "pin", "security"]):
+            await self.broadcast({"type": "status", "message": "⚠️ LinkedIn verification required — complete it in the browser window (60 sec timeout)"})
+            for _ in range(30):
+                await asyncio.sleep(2)
+                if any(x in self.page.url for x in ["feed", "mynetwork", "jobs"]):
+                    await self._linkedin_save_session()
+                    await self.broadcast({"type": "status", "message": "✅ Verification done — LinkedIn logged in"})
+                    return True
+            await self.broadcast({"type": "status", "message": "❌ Verification timeout — could not log in"})
+            return False
+
+        await self.broadcast({"type": "status", "message": f"❌ LinkedIn login failed (landed on: {url[:70]})"})
+        return False
+
+    async def _linkedin_ensure_logged_in(self):
+        """Load saved session and verify login; login fresh if session is stale."""
+        await self._linkedin_load_session()
+        if await self._linkedin_is_logged_in():
+            await self.broadcast({"type": "status", "message": "✅ LinkedIn session active"})
+            return True
+        return await self._linkedin_login()
+
+    async def _extract_linkedin_card(self, card, query: str = "") -> Optional[dict]:
+        """Extract a lead dict from a LinkedIn people search result card."""
+        try:
+            # Name — try multiple selectors (LinkedIn DOM changes frequently)
+            name = ""
+            for sel in [
+                "span.entity-result__title-text a span[aria-hidden='true']",
+                "span.entity-result__title-text span[aria-hidden='true']",
+                ".entity-result__title-text a",
+                ".entity-result__title-text",
+            ]:
+                el = await card.query_selector(sel)
+                if el:
+                    name = (await el.inner_text()).strip()
+                    if name:
+                        break
+            if not name:
+                return None
+
+            # Profile URL
+            profile_url = ""
+            link_el = await card.query_selector("a.app-aware-link[href*='/in/']")
+            if not link_el:
+                link_el = await card.query_selector("a[href*='linkedin.com/in/']")
+            if link_el:
+                href = await link_el.get_attribute("href") or ""
+                profile_url = href.split("?")[0]
+            if not profile_url:
+                return None
+
+            # Headline: "Title at Company" or "Title · Company"
+            headline = ""
+            for sel in ["div.entity-result__primary-subtitle", ".entity-result__primary-subtitle"]:
+                el = await card.query_selector(sel)
+                if el:
+                    headline = (await el.inner_text()).strip()
+                    break
+
+            # Location
+            location = ""
+            for sel in ["div.entity-result__secondary-subtitle", ".entity-result__secondary-subtitle"]:
+                el = await card.query_selector(sel)
+                if el:
+                    location = (await el.inner_text()).strip()
+                    break
+
+            # Summary snippet
+            summary = ""
+            el = await card.query_selector("p.entity-result__summary")
+            if el:
+                summary = (await el.inner_text()).strip()
+
+            # Parse title and company from headline
+            job_title, company = headline, ""
+            for sep in [" at ", " @ ", " · ", " | "]:
+                if sep in headline:
+                    parts = headline.split(sep, 1)
+                    job_title = parts[0].strip()
+                    company = parts[1].strip()
+                    break
+
+            hr_kw = ["hr", "human resources", "talent", "recruit", "people ops", "workforce", "staffing", "hris"]
+            is_hr = any(k in (job_title + " " + company).lower() for k in hr_kw)
+
+            return {
+                "contact_name": name,
+                "job_title": job_title,
+                "business_name": company,
+                "location": location,
+                "linkedin_url": profile_url,
+                "source_url": profile_url,
+                "email": "",
+                "phone": "",
+                "notes": summary[:300] if summary else "",
+                "search_query": query,
+                "is_hiring_role": is_hr,
+            }
+        except Exception:
+            return None
+
+    async def _run_linkedin_people_search(self, query: str, target_leads: int, max_pages: int = 10) -> list:
+        """Run a LinkedIn People search and return extracted leads."""
+        leads: list = []
+
+        if not await self._linkedin_ensure_logged_in():
+            return leads
+
+        search_base = f"https://www.linkedin.com/search/results/people/?keywords={quote_plus(query)}&origin=GLOBAL_SEARCH_HEADER"
+
+        for page_num in range(1, max_pages + 1):
+            if self.stop_flag:
+                break
+
+            url = search_base + (f"&page={page_num}" if page_num > 1 else "")
+            await self.broadcast({"type": "status", "message": f"🔍 LinkedIn People — page {page_num}: \"{query[:55]}\""})
+
+            try:
+                await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(2 + random.random() * 1.5)
+            except Exception as e:
+                await self.broadcast({"type": "status", "message": f"⚠️ Navigation error: {str(e)[:50]}"})
+                break
+
+            # Session expired → re-login
+            cur_url = self.page.url
+            if "login" in cur_url or "authwall" in cur_url or "uas/login" in cur_url:
+                await self.broadcast({"type": "status", "message": "🔐 Session expired — re-logging in..."})
+                if not await self._linkedin_login():
+                    break
+                await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(2)
+
+            screenshot = await self.take_screenshot(force=True)
+            if screenshot:
+                await self.broadcast({"type": "screenshot", "data": screenshot})
+
+            # Try both old and new LinkedIn selectors
+            cards = await self.page.query_selector_all("li.reusable-search__result-container")
+            if not cards:
+                cards = await self.page.query_selector_all(".search-results-container ul > li")
+
+            if not cards:
+                await self.broadcast({"type": "status", "message": f"  ⚠️ No profile cards found on page {page_num} — LinkedIn may have changed their layout"})
+                break
+
+            await self.broadcast({"type": "status", "message": f"  📋 {len(cards)} profiles on page {page_num}"})
+
+            page_leads = []
+            for card in cards:
+                lead = await self._extract_linkedin_card(card, query)
+                if lead:
+                    page_leads.append(lead)
+
+            leads.extend(page_leads)
+            await self.broadcast({"type": "status", "message": f"  ✅ Extracted {len(page_leads)} leads (running total: {len(leads)})"})
+
+            if target_leads > 0 and len(leads) >= target_leads:
+                break
+
+            # Check for next page button
+            next_btn = await self.page.query_selector('button[aria-label="Next"]')
+            if not next_btn:
+                await self.broadcast({"type": "status", "message": "  📭 No more LinkedIn pages"})
+                break
+
+            await asyncio.sleep(2.5 + random.random() * 2)
+
+        return leads
+
+    # ─── Email Enrichment Phase ───────────────────────────────────────────────
+
+    async def _run_enrichment_phase(
+        self,
+        leads: list,
+        search_id: int | None,
+        auto_enrich: bool = True,
+    ) -> int:
+        """
+        Enrich leads that have no email address.
+        Runs after extraction completes. Returns count of leads that gained an email.
+        """
+        if not auto_enrich:
+            return 0
+
+        try:
+            from app.enrichment.email_enricher import enrich_leads_batch
+        except ImportError as e:
+            await self.broadcast({"type": "status", "message": f"⚠️ Enrichment module unavailable: {e}"})
+            return 0
+
+        needs = [l for l in leads if not l.get("email")]
+        if not needs:
+            await self.broadcast({"type": "status", "message": "🔬 All leads already have emails — enrichment skipped."})
+            return 0
+
+        await self.broadcast({
+            "type": "status",
+            "message": f"━━━ 🔬 Email Enrichment Phase — {len(needs)} lead(s) to process ━━━",
+        })
+
+        enriched_count = 0
+        for i, lead in enumerate(needs):
+            if self.stop_flag:
+                await self.broadcast({"type": "status", "message": "⏹ Enrichment stopped."})
+                break
+
+            name = lead.get("contact_name") or lead.get("business_name") or "Unknown"
+            company = lead.get("business_name") or ""
+            await self.broadcast({
+                "type": "status",
+                "message": f"🔬 Enriching lead {i+1}/{len(needs)}: {name}" +
+                           (f" ({company})" if company and company != name else ""),
+            })
+
+            from app.enrichment.email_enricher import enrich_lead
+            prev_email = lead.get("email", "")
+            await enrich_lead(lead, broadcast_fn=self.broadcast)
+
+            # Persist to DB if we found an email
+            if lead.get("email") and not prev_email and lead.get("id"):
+                try:
+                    update_lead_email(
+                        lead["id"],
+                        lead["email"],
+                        lead.get("email_verified", "unknown"),
+                        lead.get("email_confidence", 0.0),
+                        lead.get("email_source", "enrichment"),
+                    )
+                    enriched_count += 1
+                except Exception as db_err:
+                    await self.broadcast({"type": "status", "message": f"  ⚠️ DB update failed: {str(db_err)[:40]}"})
+
+            # Broadcast progress for UI progress bar
+            await self.broadcast({
+                "type": "enrichment_progress",
+                "current": i + 1,
+                "total": len(needs),
+                "lead": name,
+            })
+
+            await asyncio.sleep(0.5)
+
+        # Final save — update email fields in the run's lead set
+        if search_id and leads:
+            try:
+                save_leads(search_id, leads, replace=True)
+            except Exception:
+                pass
+
+        await self.broadcast({
+            "type": "enrichment_complete",
+            "total_enriched": enriched_count,
+            "total_processed": len(needs),
+        })
+        await self.broadcast({
+            "type": "status",
+            "message": f"━━━ ✅ Enrichment done: {enriched_count}/{len(needs)} lead(s) gained an email ━━━",
+        })
+        # Push enriched leads back to UI
+        await self.broadcast({"type": "leads", "data": leads})
+        return enriched_count
+
+    # ──────────────────────────────────────────────────────────────────────────
 
     async def run_automation(
         self,
@@ -567,10 +1136,12 @@ class AutomationManager:
         reload_between_queries: bool = False,  # Fresh browser between each batch query
         email_domain_allowlist: str = "",  # Keep only leads whose email matches (see filters/email_domain_rules)
         search_site_domains: str = "",  # Append site: restrictions to each search query
+        auto_enrich: bool = True,  # Run email enrichment phase after extraction
     ):
         """Run browser automation loop through multiple queries."""
         self.is_running = True
         self.stop_flag = False
+        self._completion_sent = False  # guards against duplicate 'complete' broadcasts
         all_leads = []
         master_search_id = None  # One DB session for whole run (set after queue init)
         total_leads_extracted = 0  # Track total leads for real-time updates
@@ -594,6 +1165,10 @@ class AutomationManager:
                 await self.broadcast({"type": "status", "message": "🌐 Launching visible browser..."})
 
             def on_browser_disconnected():
+                # Ignore if we closed the browser ourselves (before enrichment phase, or on stop)
+                if self._intentional_close:
+                    return
+                # Unexpected disconnect (user closed window, crash) — stop the run
                 self.stop_flag = True
                 self.is_running = False
                 try:
@@ -683,7 +1258,9 @@ class AutomationManager:
             print("[Automation] Context created, creating page...", file=sys.stderr, flush=True)
 
             self.page = await context.new_page()
-            self.page.on("close", on_browser_disconnected)
+            # NOTE: do NOT add page.on("close", ...) here — page closes happen on every
+            # navigation redirect and would falsely trigger stop_flag mid-run.
+            # We only listen for browser-level disconnect (registered on self.browser above).
             print("[Automation] Page created, bringing to front...", file=sys.stderr, flush=True)
             try:
                 await self.page.bring_to_front()
@@ -779,18 +1356,39 @@ class AutomationManager:
                     ),
                 })
 
-            # Query queue: extend with extra phrases when DDG yields few PDFs / pages end — scales toward 100k+ targets
+            # ── Query expansion variations — added automatically when yield is low ──
+            # Phase 1: HR-specific document/page patterns
             DDG_QUERY_VARIATIONS = [
-                " list", " directory", " roster", " members", " membership",
-                " board of directors", " committee", " officers", " chapter",
-                " email directory", " staff directory", " contact list",
-                " member directory", " phone directory", " directory contact",
-                " annual report", " meeting minutes", " registration form",
-                " volunteers", " club", " association", " foundation",
-                " nonprofit", " pdf contact", " public records",
-                " state filing", " tax exempt", " organization",
-                " leadership", " team", " contacts page",
-                " site:org", " filetype:pdf intext:email",
+                " staff directory", " hr directory", " team contacts", " department directory",
+                " email directory", " contact list", " company directory", " org chart",
+                " filetype:pdf email", " filetype:pdf contact", " filetype:pdf intext:email",
+                " hr team", " talent acquisition team", " recruiting team", " people team",
+                " human resources department", " hr department contacts",
+                " leadership team", " employee directory", " annual report",
+                " conference attendees", " intext:email",
+                ' "@gmail.com"', ' "@yahoo.com"', ' "@outlook.com"',
+                " site:org", " site:edu", " inurl:team", " inurl:people",
+            ]
+            # Phase 2: Diversity modifiers — geo, industry, year — trigger DIFFERENT result sets
+            # These are appended as final fallback to break out of "no more results" dead ends
+            DDG_DIVERSITY_MODIFIERS = [
+                # US regions / states
+                "New York", "California", "Texas", "Florida", "Illinois",
+                "Georgia", "Washington", "Massachusetts", "Colorado", "Arizona",
+                "Seattle", "Chicago", "Boston", "Austin", "Atlanta", "Denver",
+                "San Francisco", "Los Angeles", "Houston", "Philadelphia",
+                # Industry verticals
+                "healthcare", "finance", "manufacturing", "retail", "education",
+                "government", "nonprofit", "logistics", "real estate", "insurance",
+                "pharmaceuticals", "biotech", "aerospace", "energy", "construction",
+                # Company size descriptors
+                "Fortune 500", "enterprise", "startup", "mid-size", "SMB",
+                "publicly traded", "private equity", "venture backed",
+                # Time qualifiers (different result sets each year)
+                "2024", "2023", "2022",
+                # Professional contexts
+                "SHRM", "HR Tech", "Workday", "SAP SuccessFactors",
+                "remote work", "hybrid workplace", "diversity inclusion",
             ]
             if ddg_html_first_mode:
                 DDG_QUERY_VARIATIONS = [
@@ -798,6 +1396,10 @@ class AutomationManager:
                 ]
             query_queue = list(queries)
             initial_queries_frozen = frozenset((q or "").strip() for q in queries if (q or "").strip())
+            # Track per-base-query yield: base_query → total leads from that base + its variations
+            base_query_leads: dict[str, int] = {}
+            # Track which diversity modifier index we're at for each base query
+            base_diversity_idx: dict[str, int] = {}
             variation_idx = 0
             query_idx = 0
 
@@ -885,7 +1487,6 @@ class AutomationManager:
                                 "Upgrade-Insecure-Requests": "1",
                             })
                             self.page = await self._context.new_page()
-                            self.page.on("close", on_browser_disconnected)
                             await self.page.add_init_script(_init_script)
                             await self.broadcast({"type": "status", "message": "✅ Fresh browser ready for next batch"})
                             reload_ok = True
@@ -908,7 +1509,6 @@ class AutomationManager:
                                 "Upgrade-Insecure-Requests": "1",
                             })
                             self.page = await self._context.new_page()
-                            self.page.on("close", on_browser_disconnected)
                             await self.page.add_init_script(_init_script)
                             reload_ok = True
                             await self.broadcast({"type": "status", "message": "✅ Context recovered, continuing..."})
@@ -925,14 +1525,15 @@ class AutomationManager:
                     total_queued = query_idx + len(query_queue)
                     q_preview = effective_query if len(effective_query) <= 72 else effective_query[:69] + "..."
                     await self.broadcast({
+                        "type": "status",
+                        "message": f"--- Query {query_idx}/{total_queued}: \"{q_preview}\" ---",
+                    })
+                    # ── Broadcast query progress for UI counter ──────────────────────────────
+                    await self.broadcast({
                         "type": "query_progress",
                         "current": query_idx,
                         "total": total_queued,
-                        "current_query": effective_query[:80],
-                    })
-                    await self.broadcast({
-                        "type": "status",
-                        "message": f"--- Query {query_idx} (total in queue: {total_queued}): \"{q_preview}\" ---",
+                        "current_query": q_preview,
                     })
 
                     # Reuse the same DB session for every queue item (variants included)
@@ -947,9 +1548,18 @@ class AutomationManager:
 
                     # ─── DuckDuckGo flow (no CAPTCHA) ─────────────────────────────────────────
                     if search_engine == "duckduckgo":
-                        # PDF runs: filetype:pdf improves hits. Reddit-only site: forces empty SERPs + we need HTML URLs.
                         q = effective_query.strip()
-                        if not ddg_html_first_mode:
+                        # LinkedIn profile pages are HTML — adding filetype:pdf returns zero results.
+                        # Snippet extraction is used instead of visiting the page.
+                        is_linkedin_query = "linkedin.com" in q.lower()
+                        if is_linkedin_query:
+                            # DDG HTML endpoint rejects site:linkedin.com — convert to keyword search
+                            q = re.sub(r'site:linkedin\.com(?:/[^\s]*)?\s*', 'linkedin ', q, flags=re.IGNORECASE).strip()
+                            await self.broadcast({
+                                "type": "status",
+                                "message": f"🔗 LinkedIn query — keyword mode: {q[:70]}",
+                            })
+                        if not ddg_html_first_mode and not is_linkedin_query:
                             if "filetype:pdf" not in q.lower() and "filetype: pdf" not in q.lower():
                                 q = f"{q} filetype:pdf"
                         if len(q) > MAX_DDG_QUERY_CHARS:
@@ -967,6 +1577,8 @@ class AutomationManager:
                         await self.broadcast({"type": "status", "message": f"  🔍 Query: {q[:60]}..."})
                         processed_urls = set()
                         pdf_count = 0
+                        html_pages_this_query = 0  # throttle: max HTML pages per query to avoid slowdown
+                        MAX_HTML_PAGES_PER_QUERY = 12  # process up to 12 HTML pages then skip the rest
                         no_more_ddg_pages = False
                         ddg_page = 0
                         ddg_flow_error = False
@@ -1016,6 +1628,15 @@ class AutomationManager:
                                 for elem in result_elems:
                                     if self.stop_flag:
                                         break
+                                    # Grab snippet text from result container (used for LinkedIn extraction)
+                                    elem_snippet = ""
+                                    try:
+                                        snippet_el = await elem.query_selector(".result__snippet")
+                                        if snippet_el:
+                                            elem_snippet = (await snippet_el.inner_text() or "").strip()
+                                    except Exception:
+                                        pass
+
                                     links_in_elem = await elem.query_selector_all("a[href*='uddg='], a[href*='/l/']")
                                     if not links_in_elem:
                                         link_el = await elem.query_selector(".result__a") or await elem.query_selector(".result__url")
@@ -1028,7 +1649,7 @@ class AutomationManager:
                                     for link_el in links_in_elem:
                                         try:
                                             href = await link_el.get_attribute("href")
-                                            title = (await link_el.inner_text() or "").strip() or "PDF"
+                                            title = (await link_el.inner_text() or "").strip() or "Result"
                                             if not href:
                                                 continue
                                             # Resolve DDG redirect (uddg=encoded_url)
@@ -1044,20 +1665,35 @@ class AutomationManager:
                                             kind = _classify_ddg_serp_href(href, ddg_html_first_mode)
                                             if href in processed_urls or kind is None:
                                                 continue
+                                            # Throttle HTML pages per query to avoid runaway slowdown
+                                            if kind == "html" and "linkedin.com/in/" not in href.lower():
+                                                if html_pages_this_query >= MAX_HTML_PAGES_PER_QUERY:
+                                                    await self.broadcast({
+                                                        "type": "status",
+                                                        "message": f"  ⏭️ HTML page limit reached ({MAX_HTML_PAGES_PER_QUERY}/query) — skipping remaining HTML, processing PDFs only",
+                                                    })
+                                                    continue
+                                                html_pages_this_query += 1
                                             processed_urls.add(href)
                                             pdf_count += 1
                                             display_link = urlparse(href).netloc if href.startswith("http") else ""
-                                            label = "PDF" if kind == "pdf" else "page"
+                                            is_linkedin = "linkedin.com/in/" in href.lower()
+                                            label = "PDF" if kind == "pdf" else ("LinkedIn" if is_linkedin else "🌐 HTML page")
                                             await self.broadcast({
                                                 "type": "status",
-                                                "message": f"  📄 [{pdf_count}] ({label}) {title[:50]}...",
+                                                "message": f"  📄 [{pdf_count}] ({label}) {title[:50]}",
                                             })
-                                            if pdf_count % 10 == 0:  # Screenshot every 10 PDFs for Live Browser View
+                                            if pdf_count % 10 == 0:
                                                 ss = await self.take_screenshot()
                                                 if ss:
                                                     await self.broadcast({"type": "screenshot", "data": ss})
                                             if kind == "pdf":
                                                 pdf_leads = await self.extract_from_pdf(href, title, display_link)
+                                            elif is_linkedin:
+                                                # Snippet extraction — never visits the LinkedIn page
+                                                pdf_leads = await self.extract_from_linkedin_snippet(
+                                                    href, title, elem_snippet, display_link
+                                                )
                                             else:
                                                 pdf_leads = await self.extract_from_html(href, title, display_link)
                                             if pdf_leads:
@@ -1115,52 +1751,91 @@ class AutomationManager:
                                 "type": "status",
                                 "message": f"⚠️ Query {query_idx}: No leads extracted from DuckDuckGo",
                             })
-                        # Add query variations when: pages exhausted OR yield is low vs target (~10k soft floor)
+                        # ── Auto-expansion: keep adding queries until this base hits 2500 leads ──
+                        # Determine the "base" query (strip variations to get original root)
+                        # The base is the original query from initial_queries_frozen it was derived from
+                        base_root = query
+                        for orig in initial_queries_frozen:
+                            if query.startswith(orig) or orig in query:
+                                base_root = orig
+                                break
+                        # Accumulate leads toward the 2500 threshold per base query
+                        base_query_leads[base_root] = base_query_leads.get(base_root, 0) + len(query_leads)
+                        base_total = base_query_leads[base_root]
+
+                        PER_QUERY_TARGET = 2500          # target leads per original query
                         under_target = target_leads > 0 and total_leads_extracted < target_leads
                         no_limit_mode = target_leads == 0
-                        max_auto_variations = min(60, len(DDG_QUERY_VARIATIONS))
-                        yield_threshold = (
-                            min(10000, max(500, target_leads // 10))
-                            if target_leads > 0
-                            else 2500
-                        )
-                        under_yield = len(query_leads) < yield_threshold and (
-                            target_leads == 0 or len(query_leads) < int(target_leads * 0.95)
-                        )
-                        can_add = (
-                            variation_idx < len(DDG_QUERY_VARIATIONS)
-                            and variation_idx < max_auto_variations
-                            and (under_target or no_limit_mode)
-                        )
-                        # Expand when: no more SERP pages, or finished max_pages with low yield, or DDG crashed with 0 leads
-                        if (
-                            can_add
+                        base_under_target = base_total < PER_QUERY_TARGET
+                        need_more = (under_target or no_limit_mode) and base_under_target
+                        is_linkedin_q = "linkedin" in query.lower()
+
+                        should_expand = (
+                            need_more
                             and not self.stop_flag
+                            and not is_linkedin_q
                             and (
                                 no_more_ddg_pages
-                                or (under_yield and ddg_page == max_pages)
+                                or (ddg_page >= max_pages and len(query_leads) < PER_QUERY_TARGET)
                                 or (ddg_flow_error and len(query_leads) == 0)
                             )
-                        ):
+                        )
+
+                        if should_expand:
                             base = _strip_trailing_filetype_pdf(query)
-                            suffix = DDG_QUERY_VARIATIONS[variation_idx].strip()
-                            variation_idx += 1
-                            if "filetype:" in suffix.lower():
-                                new_q = (base + " " + suffix).replace("  ", " ").strip()
-                            elif ddg_html_first_mode:
-                                new_q = (base + " " + suffix).replace("  ", " ").strip()
-                            else:
-                                new_q = (base + " " + suffix + " filetype:pdf").replace("  ", " ").strip()
-                            query_queue.append(new_q)
-                            reason = (
-                                f"reach {target_leads} leads (soft floor {yield_threshold}/pass)"
-                                if target_leads > 0
-                                else f"expand search (floor {yield_threshold} leads/pass)"
-                            )
-                            await self.broadcast({
-                                "type": "status",
-                                "message": f"  🔄 Adding query variation ({reason}): \"{new_q[:55]}...\"",
-                            })
+                            added = 0
+                            # How many to add: more aggressive when yield is very low
+                            batch_size = 3 if len(query_leads) < 5 else 1
+
+                            # Phase 1: standard HR variations
+                            while added < batch_size and variation_idx < len(DDG_QUERY_VARIATIONS):
+                                suffix = DDG_QUERY_VARIATIONS[variation_idx].strip()
+                                variation_idx += 1
+                                if "filetype:" in suffix.lower():
+                                    new_q = (base + " " + suffix).replace("  ", " ").strip()
+                                elif ddg_html_first_mode:
+                                    new_q = (base + " " + suffix).replace("  ", " ").strip()
+                                else:
+                                    new_q = (base + " " + suffix + " filetype:pdf").replace("  ", " ").strip()
+                                if new_q not in (q for q in query_queue):
+                                    query_queue.append(new_q)
+                                    added += 1
+                                    await self.broadcast({
+                                        "type": "status",
+                                        "message": f"  🔄 Variation {variation_idx}: \"{new_q[:65]}\"",
+                                    })
+
+                            # Phase 2: diversity modifiers (geo/industry/year) — after standard exhausted
+                            div_idx = base_diversity_idx.get(base_root, 0)
+                            while added < batch_size and div_idx < len(DDG_DIVERSITY_MODIFIERS):
+                                mod = DDG_DIVERSITY_MODIFIERS[div_idx]
+                                div_idx += 1
+                                new_q = f"{base} {mod}".strip()
+                                if not ddg_html_first_mode and "filetype:pdf" not in new_q.lower():
+                                    new_q = f"{new_q} filetype:pdf"
+                                if new_q not in (q for q in query_queue):
+                                    query_queue.append(new_q)
+                                    added += 1
+                                    await self.broadcast({
+                                        "type": "status",
+                                        "message": f"  🌍 Diversity modifier: \"{new_q[:65]}\"",
+                                    })
+                            base_diversity_idx[base_root] = div_idx
+
+                            if added > 0:
+                                still_need = max(0, PER_QUERY_TARGET - base_total)
+                                await self.broadcast({
+                                    "type": "status",
+                                    "message": f"  📈 Added {added} new queries (base has {base_total} leads, targeting {PER_QUERY_TARGET}, need ~{still_need} more)",
+                                })
+                        await self.broadcast({"type": "leads", "data": query_leads})
+                        continue
+                    elif search_engine == "linkedin_direct":
+                        # ─── LinkedIn Direct flow ────────────────────────────────────────────────
+                        query_leads = await self._run_linkedin_people_search(
+                            effective_query, target_leads, max_pages
+                        )
+                        total_leads_extracted += len(query_leads)
                         await self.broadcast({"type": "leads", "data": query_leads})
                         continue
                     else:
@@ -1832,7 +2507,24 @@ class AutomationManager:
                         "message": f"⚠️ Final DB update error: {str(e)[:60]}",
                     })
             
+            # ── Close browser NOW (enrichment uses httpx/SMTP, not browser) ────
+            # This makes the browser window disappear before the enrichment phase,
+            # so users see a clean "Enriching..." state with no stale browser open.
+            await self.broadcast({"type": "status", "message": "🔚 Closing browser..."})
+            _early_close_errors = await self.shutdown_playwright()
+            if _early_close_errors:
+                await self.broadcast({"type": "status", "message": f"⚠️ Browser close: {', '.join(_early_close_errors[:2])}"})
+            else:
+                await self.broadcast({"type": "status", "message": "✅ Browser closed"})
+
+            # ── Email Enrichment Phase (runs BEFORE broadcasting complete) ────
+            # "Done" is shown to user only AFTER enrichment finishes.
+            if all_leads and not self.stop_flag and auto_enrich:
+                await self._run_enrichment_phase(all_leads, master_search_id, auto_enrich=True)
+
+            # All steps done → tell UI we're complete (triggers "✅ Done" in progress board)
             await self.broadcast({"type": "complete", "data": all_leads})
+            self._completion_sent = True  # prevents finally block from sending a duplicate
 
         except Exception as e:
             import traceback
@@ -1871,99 +2563,30 @@ class AutomationManager:
                         "message": f"⚠️ Final save error: {str(e)[:60]}",
                     })
             
-            # Cleanup browser (closes context + browser so external window exits)
+            # Cleanup browser (safe no-op if already closed by try block or stop handler)
             cleanup_errors = await self.shutdown_playwright()
-            
-            # CRITICAL: Always send completion signal, even on error
-            # Set is_running to False FIRST so UI knows it's done
+
             self.is_running = False
             self.current_session_id = None
-            
-            # Send completion signal (multiple attempts)
-            completion_sent = False
-            for attempt in range(3):
-                try:
-                    await self.broadcast({
-                        "type": "complete",
-                        "data": final_leads if final_leads else [],
-                    })
-                    completion_sent = True
-                    break
-                except Exception as e:
-                    if attempt < 2:
-                        await asyncio.sleep(0.5)  # Retry
-                    else:
-                        # Last attempt failed - log but continue
-                        print(f"Failed to send completion signal: {e}")
-            
-            if cleanup_errors:
-                try:
-                    await self.broadcast({
-                        "type": "status",
-                        "message": f"🔚 Browser closed (warnings: {', '.join(cleanup_errors)})",
-                    })
-                except Exception:
-                    pass
-            else:
-                try:
-                    await self.broadcast({"type": "status", "message": "🔚 Browser closed"})
-                except Exception:
-                    pass
+
+            # Only send 'complete' here if neither the try block nor the stop handler
+            # already sent it (prevents duplicate "Done" signals to the UI)
+            if not self._completion_sent:
+                for attempt in range(3):
+                    try:
+                        await self.broadcast({
+                            "type": "complete",
+                            "data": final_leads if final_leads else [],
+                        })
+                        break
+                    except Exception as e:
+                        if attempt < 2:
+                            await asyncio.sleep(0.5)
+                        else:
+                            print(f"[Automation] Failed to send fallback completion signal: {e}")
 
 
 manager = AutomationManager()
-
-
-async def _do_stop(mgr: AutomationManager) -> None:
-    """
-    Hard-stop the running automation.
-    1. Set flags so every stop_flag check inside run_automation exits its loop.
-    2. Cancel the asyncio Task — raises CancelledError at the next await point,
-       which unwinds the coroutine even if it's deep inside a page scrape.
-    3. Shut down Playwright so the visible browser window closes immediately.
-    4. Save buffered leads to DB and broadcast complete.
-    """
-    mgr.stop_flag = True
-    mgr.is_running = False
-
-    # Cancel the task immediately — this is the key fix.
-    # Previously the task ran forever because only stop_flag was set.
-    if mgr.task and not mgr.task.done():
-        mgr.task.cancel()
-        try:
-            await asyncio.wait_for(asyncio.shield(mgr.task), timeout=2.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass  # Expected — task was cancelled
-
-    await mgr.broadcast({"type": "status", "message": "🛑 Stop requested — saving leads and closing browser…"})
-
-    # Save buffered leads before closing browser
-    if mgr.all_leads_buffer and mgr.current_session_id:
-        try:
-            saved_count = save_leads(mgr.current_session_id, mgr.all_leads_buffer, replace=True)
-            await mgr.broadcast({"type": "status", "message": f"💾 Saved {saved_count} leads to database before stopping"})
-        except Exception as e:
-            await mgr.broadcast({"type": "status", "message": f"⚠️ Error saving leads on stop: {str(e)[:60]}"})
-
-    # Close browser window
-    pw_errs = await mgr.shutdown_playwright()
-    status_msg = f"🔚 Browser shutdown: {', '.join(pw_errs[:3])}" if pw_errs else "🔚 Browser closed"
-    await mgr.broadcast({"type": "status", "message": status_msg})
-
-    # Signal UI that run is complete
-    try:
-        await mgr.broadcast({"type": "complete", "data": mgr.all_leads_buffer or []})
-    except Exception:
-        pass
-
-    mgr.task = None
-
-
-@app.post("/stop")
-async def http_stop():
-    """HTTP fallback stop — works even if the WebSocket connection was dropped."""
-    await _do_stop(manager)
-    return {"status": "stopped", "saved": len(manager.all_leads_buffer)}
 
 
 @app.websocket("/ws")
@@ -2003,13 +2626,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     target_leads = data.get("target_leads", 0)
                     raw = data.get("search_engine", "duckduckgo")
                     search_engine = str(raw).lower().strip() if raw else "duckduckgo"
-                    if search_engine not in ("duckduckgo", "google"):
+                    if search_engine not in ("duckduckgo", "google", "linkedin_direct"):
                         search_engine = "duckduckgo"
                     headless = bool(data.get("headless", False))
                     reload_between_queries = bool(data.get("reload_between_queries", False))
 
-                    # Run automation in background — store task so Stop can cancel it
-                    manager.task = asyncio.create_task(manager.run_automation(
+                    auto_enrich = bool(data.get("auto_enrich", True))
+
+                    # Run automation in background
+                    asyncio.create_task(manager.run_automation(
                         queries=queries,
                         max_pages=max_pages,
                         delay_between_pages=delay_pages,
@@ -2020,10 +2645,47 @@ async def websocket_endpoint(websocket: WebSocket):
                         reload_between_queries=reload_between_queries,
                         email_domain_allowlist=str(data.get("email_domain_allowlist") or "").strip(),
                         search_site_domains=str(data.get("search_site_domains") or "").strip(),
+                        auto_enrich=auto_enrich,
                     ))
 
                 elif command == "stop":
-                    await _do_stop(manager)
+                    manager.stop_flag = True
+                    manager.is_running = False  # Force stop
+                    await manager.broadcast({"type": "status", "message": "🛑 Stop requested - saving leads and closing browser..."})
+                    
+                    # Save all leads in buffer before stopping
+                    if manager.all_leads_buffer and manager.current_session_id:
+                        try:
+                            saved_count = save_leads(manager.current_session_id, manager.all_leads_buffer, replace=True)
+                            await manager.broadcast({
+                                "type": "status",
+                                "message": f"💾 Saved {saved_count} leads to database before stopping",
+                            })
+                        except Exception as e:
+                            await manager.broadcast({
+                                "type": "status",
+                                "message": f"⚠️ Error saving leads on stop: {str(e)[:60]}",
+                            })
+                    
+                    # Close Playwright immediately so the visible browser window exits (run_automation may still unwind)
+                    pw_errs = await manager.shutdown_playwright()
+                    if pw_errs:
+                        await manager.broadcast({
+                            "type": "status",
+                            "message": f"🔚 Browser shutdown: {', '.join(pw_errs[:3])}",
+                        })
+                    else:
+                        await manager.broadcast({"type": "status", "message": "🔚 Browser closed"})
+
+                    # Force completion signal with all leads collected so far
+                    try:
+                        await manager.broadcast({
+                            "type": "complete",
+                            "data": manager.all_leads_buffer if manager.all_leads_buffer else [],
+                        })
+                        manager._completion_sent = True  # prevent finally block duplicate
+                    except Exception:
+                        pass
                     
             except Exception as e:
                 # Log error but keep connection alive
@@ -2054,6 +2716,31 @@ async def root():
     return {"status": "Automation server running", "websocket": "/ws"}
 
 
+@app.post("/enrich")
+async def enrich_existing_leads():
+    """
+    Trigger email enrichment for all DB leads that have no email address.
+    Runs as a background task and broadcasts progress via WebSocket.
+    """
+    if manager.is_running:
+        return {"status": "busy", "message": "Automation is currently running. Try after it completes."}
+
+    leads = get_leads_without_email()
+    if not leads:
+        return {"status": "ok", "message": "No leads without email found.", "count": 0}
+
+    async def _background_enrich():
+        manager.is_running = True
+        manager.stop_flag = False
+        try:
+            await manager._run_enrichment_phase(leads, search_id=None, auto_enrich=True)
+        finally:
+            manager.is_running = False
+
+    asyncio.create_task(_background_enrich())
+    return {"status": "enrichment_started", "count": len(leads)}
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)

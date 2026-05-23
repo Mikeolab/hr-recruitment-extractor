@@ -19,7 +19,7 @@ SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 
 # Server
 HOST = os.getenv("HOST", "127.0.0.1")
-PORT = int(os.getenv("PORT", "8000"))
+PORT = int(os.getenv("PORT", "8001"))
 
 # Rate limits per tier (searches per day)
 TIER_LIMITS = {
