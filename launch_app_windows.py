@@ -275,7 +275,8 @@ def start_fastapi_server(port: int) -> bool:
         from app.server.automation_server import app as fastapi_app
 
         config = uvicorn.Config(
-            fastapi_app, host="127.0.0.1", port=port, log_level="error"
+            fastapi_app, host="127.0.0.1", port=port, log_level="error",
+            log_config=None,  # Prevent "Unable to configure formatter 'default'" in frozen EXE
         )
         server = uvicorn.Server(config)
 
