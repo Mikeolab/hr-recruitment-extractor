@@ -15,13 +15,13 @@ if getattr(sys, 'frozen', False):
     # For data files, use platform-specific user data directory
     if sys.platform == 'win32':
         # Windows: Use AppData\Roaming
-        USER_DATA_DIR = Path(os.environ.get('APPDATA', Path.home())) / "LeadExtractorPro"
+        USER_DATA_DIR = Path(os.environ.get('APPDATA', Path.home())) / "HRExtractor"
     elif sys.platform == 'darwin':
         # macOS: Use Library/Application Support
-        USER_DATA_DIR = Path.home() / "Library" / "Application Support" / "LeadExtractorPro"
+        USER_DATA_DIR = Path.home() / "Library" / "Application Support" / "HRExtractor"
     else:
         # Linux/Other: Use .local/share
-        USER_DATA_DIR = Path.home() / ".local" / "share" / "LeadExtractorPro"
+        USER_DATA_DIR = Path.home() / ".local" / "share" / "HRExtractor"
     USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 else:
     # Running as script

@@ -247,6 +247,9 @@ def _main():
     print(f"  UI  -> {url}")
     print(f"  API -> http://localhost:{_API_PORT}")
     print()
+    print("  If the browser shows an error, check:")
+    print(f"    {_ST_LOG}")
+    print()
     print("  Close this window (or press Ctrl+C) to stop.")
     print("=" * 60)
 
@@ -254,6 +257,20 @@ def _main():
         proc.wait()
     except KeyboardInterrupt:
         _log("Ctrl+C — shutting down")
+    else:
+        # Streamlit exited on its own — check why
+        rc = proc.returncode
+        if rc not in (0, None):
+            tail = _tail_log(_ST_LOG)
+            _log(f"WARNING: Streamlit exited with code {rc}")
+            print()
+            print("=" * 60)
+            print(f"  ⚠  Streamlit crashed (exit code {rc})")
+            print(f"  Log: {_ST_LOG}")
+            if tail:
+                print(f"\n  Last output:\n{tail[-1500:]}")
+            print("=" * 60)
+            input("Press Enter to exit.")
     finally:
         try:
             proc.terminate()

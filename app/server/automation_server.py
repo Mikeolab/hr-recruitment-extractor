@@ -18,8 +18,11 @@ from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional, Literal
 import warnings
-from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
-warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+try:
+    from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+    warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+except ImportError:
+    from bs4 import BeautifulSoup  # bs4 < 4.12 — no XMLParsedAsHTMLWarning
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright, Page, Browser
