@@ -17,7 +17,9 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional, Literal
-from bs4 import BeautifulSoup
+import warnings
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright, Page, Browser
@@ -2614,15 +2616,25 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 if command == "start":
                     headless_val = bool(data.get("headless", False))
-                    print(f"[Automation] START received: headless={headless_val}, queries={len(data.get('queries', []))}", file=sys.stderr, flush=True)
+                    n_queries = len(data.get("queries", []))
+                    print(f"[Automation] START received: headless={headless_val}, queries={n_queries}", file=sys.stderr, flush=True)
+
+                    # Guard: reject immediately if already running.
+                    # is_running is set True HERE (before create_task) so concurrent
+                    # WebSocket reconnects / duplicate clicks all see it instantly.
                     if manager.is_running:
+                        print(f"[Automation] Duplicate START ignored (already running)", file=sys.stderr, flush=True)
                         await websocket.send_json({
-                            "type": "error",
-                            "message": "⚠️ Automation already running",
+                            "type": "status",
+                            "message": "⚠️ Automation is already running — ignoring duplicate start",
                         })
                         continue
-                    
+
                     queries = data.get("queries", [])
+                    if not queries:
+                        await websocket.send_json({"type": "error", "message": "No queries provided"})
+                        continue
+
                     max_pages = data.get("max_pages", 10)
                     delay_pages = data.get("delay_pages", 3.0)
                     delay_actions = data.get("delay_actions", 1.0)
@@ -2633,8 +2645,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         search_engine = "duckduckgo"
                     headless = bool(data.get("headless", False))
                     reload_between_queries = bool(data.get("reload_between_queries", False))
-
                     auto_enrich = bool(data.get("auto_enrich", True))
+
+                    # Claim the lock BEFORE spawning the task so any concurrent
+                    # WS message processed in the same event-loop tick is rejected.
+                    manager.is_running = True
+                    manager.stop_flag = False
 
                     # Run automation in background
                     asyncio.create_task(manager.run_automation(

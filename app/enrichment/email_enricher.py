@@ -23,12 +23,17 @@ import asyncio
 import re
 import smtplib
 import socket
+import warnings
 from typing import Callable, Optional
 from urllib.parse import urlparse, quote_plus
 
 import dns.resolver
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+
+# Suppress "XMLParsedAsHTMLWarning" that BeautifulSoup emits when parsing
+# XML/XHTML pages with the HTML lxml parser — harmless but noisy in the console.
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 from app.extractors.email_extractor import JUNK_DOMAINS, JUNK_PREFIXES, EMAIL_PATTERN
 
