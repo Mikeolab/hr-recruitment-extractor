@@ -75,11 +75,20 @@ def _port_free(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) != 0
 
 
-def _wait_for_port(port: int, timeout: float = 45.0) -> bool:
+def _wait_for_port(port: int, timeout: float = 45.0,
+                   proc: "subprocess.Popen | None" = None) -> bool:
+    """
+    Wait until *port* is in use (something is listening).
+    If *proc* is given, also checks that the process is still alive;
+    returns False immediately if the process exits before the port is up.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         if not _port_free(port):
             return True
+        # If the subprocess exited, don't keep waiting.
+        if proc is not None and proc.poll() is not None:
+            return False
         time.sleep(0.5)
     return False
 
@@ -202,6 +211,13 @@ def _main():
     _log(f"BASE : {BASE}")
     _log(f"Logs : {_LOG_DIR}")
 
+    # ── Pre-flight: check ports are free ────────────────────────────────────
+    for port, name in [(_API_PORT, "API"), (_ST_PORT, "Streamlit")]:
+        if not _port_free(port):
+            _log(f"WARNING: Port {port} ({name}) is ALREADY IN USE before we started it. "
+                 f"Another process may be occupying it. The app may not work correctly.")
+            print(f"  ⚠  Port {port} already in use — closing old HRExtractor first may help.")
+
     # ── Start FastAPI ────────────────────────────────────────────────────────
     _log(f"Starting API server on port {_API_PORT}...")
     threading.Thread(target=_run_api_server, daemon=True, name="api-server").start()
@@ -219,18 +235,27 @@ def _main():
     proc = _spawn_streamlit()
     _log(f"Streamlit PID: {proc.pid}")
 
-    if not _wait_for_port(_ST_PORT, timeout=60):
+    # Pass proc so we abort early if the child process exits before the port is up
+    if not _wait_for_port(_ST_PORT, timeout=60, proc=proc):
+        rc = proc.poll()
         tail = _tail_log(_ST_LOG)
-        _log(f"ERROR: Streamlit did not start within 60 s\nStreamlit stderr:\n{tail or '(empty)'}")
+        if rc is not None:
+            _log(f"ERROR: Streamlit process exited early (code {rc})")
+        else:
+            _log(f"ERROR: Streamlit did not start within 60 s")
+        _log(f"Streamlit stderr:\n{tail or '(empty)'}")
         print()
         print("=" * 60)
-        print("  Streamlit failed to start.")
-        print(f"  See log: {_ST_LOG}")
+        print(f"  Streamlit failed to start (exit code: {rc}).")
+        print(f"  Log: {_ST_LOG}")
         if tail:
-            print(f"\n  Last output:\n{tail[-500:]}")
+            print(f"\n  Last output:\n{tail[-800:]}")
         print("=" * 60)
         input("Press Enter to exit.")
-        proc.terminate()
+        try:
+            proc.terminate()
+        except Exception:
+            pass
         return
 
     _log(f"Streamlit ready on port {_ST_PORT}")
