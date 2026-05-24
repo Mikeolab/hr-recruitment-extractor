@@ -206,7 +206,7 @@ suppress_pdfminer_color_warnings()
 import pdfplumber
 
 from app.extractors.email_extractor import extract_emails
-from app.extractors.name_extractor import extract_contact_names, extract_names_from_email
+from app.extractors.name_extractor import extract_contact_names, extract_names_from_email, url_to_company_name
 from app.extractors.phone_extractor import extract_phones
 from app.extractors.hr_title_extractor import extract_title, extract_company_info
 from app.database.db import save_search, save_leads, get_leads_without_email, update_lead_email
@@ -501,7 +501,7 @@ class AutomationManager:
 
             # Run HR title/company enrichment on the full PDF text once
             hr_info = extract_title(pdf_text)
-            company_info = extract_company_info(pdf_text)
+            company_info = extract_company_info(pdf_text, source_url=pdf_url)
 
             # Create lead entries
             if emails:
@@ -603,6 +603,9 @@ class AutomationManager:
                         parsed_url = urlparse(str(response.url))
                         page_domain = parsed_url.netloc.lstrip("www.")
                         website_from_page = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                        # Fallback company name: derive from domain if not yet set
+                        if not company_name_from_page:
+                            company_name_from_page = url_to_company_name(str(response.url))
                     except Exception:
                         pass
                     # Also grab mailto: links directly from HTML (most reliable email source)

@@ -83,34 +83,70 @@ def extract_title(text: str) -> Dict[str, str | List[str]]:
     return result
 
 
-def extract_company_info(text: str) -> Dict[str, str | None]:
+def extract_company_info(text: str, source_url: str = "") -> Dict[str, str | None]:
     """
-    Extract company information from text.
+    Extract company information from text and/or the source URL.
 
-    Args:
-        text: Text to search for company info
-
-    Returns:
-        Dictionary with company details
+    Returns a dict with:
+      company_name  — best guess at the organisation name
+      industry      — industry sector if detectable
+      company_size  — startup / small / mid / large
     """
-    result = {
+    from app.extractors.name_extractor import url_to_company_name
+
+    result: Dict[str, str | None] = {
         "company_name": None,
         "industry": None,
         "company_size": None,
     }
 
-    # Simple company size detection
+    text_lower = text.lower()
+
+    # ── Company name from text patterns ──────────────────────────────────────
+    # Pattern: "Welcome to <Company>" / "About <Company>" / "<Company> HR Dept"
+    company_patterns = [
+        r"welcome\s+to\s+([A-Z][A-Za-z0-9 &.,'-]{2,50})",
+        r"about\s+([A-Z][A-Za-z0-9 &.,'-]{2,50})\s*(?:\||–|—|\n)",
+        r"©\s*\d{4}\s+([A-Z][A-Za-z0-9 &.,'-]{2,50})",
+        r"([A-Z][A-Za-z0-9 &.,'-]{2,50})\s+(?:HR|Human Resources)\s+(?:Department|Team|Office)",
+        r"([A-Z][A-Za-z0-9 &.,'-]{2,50})\s+(?:Careers|Jobs|Recruitment)",
+    ]
+    for pat in company_patterns:
+        m = re.search(pat, text)
+        if m:
+            candidate = m.group(1).strip().rstrip(".,")
+            if 3 < len(candidate) < 60:
+                result["company_name"] = candidate
+                break
+
+    # ── Fallback: derive company name from source URL domain ─────────────────
+    if not result["company_name"] and source_url:
+        result["company_name"] = url_to_company_name(source_url) or None
+
+    # ── Company size ──────────────────────────────────────────────────────────
     size_patterns = {
         "startup": r"\b(startup|early-stage|seed)\b",
-        "small": r"\b(small|sme|10-50|1-10)\b",
-        "mid": r"\b(mid-size|100-500|mid-market)\b",
-        "large": r"\b(enterprise|large|500\+|1000\+)\b",
+        "small":   r"\b(small business|sme|10-50 employees|1-10 employees)\b",
+        "mid":     r"\b(mid-size|100-500 employees|mid-market)\b",
+        "large":   r"\b(enterprise|large company|500\+ employees|1000\+ employees)\b",
     }
-
-    text_lower = text.lower()
     for size, pattern in size_patterns.items():
         if re.search(pattern, text_lower, re.IGNORECASE):
             result["company_size"] = size
+            break
+
+    # ── Industry ──────────────────────────────────────────────────────────────
+    industry_map = {
+        "healthcare": r"\b(hospital|clinic|health system|medical center|healthcare)\b",
+        "technology": r"\b(software|tech company|saas|cloud|platform)\b",
+        "government": r"\b(government|municipality|county|state agency|federal)\b",
+        "education":  r"\b(university|college|school district|academy)\b",
+        "finance":    r"\b(bank|insurance|financial services|investment)\b",
+        "nonprofit":  r"\b(non-profit|nonprofit|501c|charity|foundation)\b",
+    }
+    for industry, pattern in industry_map.items():
+        if re.search(pattern, text_lower, re.IGNORECASE):
+            result["industry"] = industry
             break
 
     return result
