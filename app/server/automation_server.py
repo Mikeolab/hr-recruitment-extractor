@@ -272,6 +272,7 @@ class AutomationManager:
         self.playwright = None
         self.is_running = False
         self.stop_flag = False
+        self._current_task: "asyncio.Task | None" = None   # handle so Stop can cancel it
         self._intentional_close = False  # Set True before shutdown so on_browser_disconnected ignores it
         self.last_screenshot_time = 0
         self.screenshot_throttle = 1.0  # Max 1 screenshot per second
@@ -2575,6 +2576,7 @@ class AutomationManager:
             cleanup_errors = await self.shutdown_playwright()
 
             self.is_running = False
+            self._current_task = None
             self.current_session_id = None
 
             # Only send 'complete' here if neither the try block nor the stop handler
@@ -2655,8 +2657,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     manager.is_running = True
                     manager.stop_flag = False
 
-                    # Run automation in background
-                    asyncio.create_task(manager.run_automation(
+                    # Run automation in background — store the task so Stop can cancel it
+                    manager._current_task = asyncio.create_task(manager.run_automation(
                         queries=queries,
                         max_pages=max_pages,
                         delay_between_pages=delay_pages,
@@ -2672,24 +2674,19 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 elif command == "stop":
                     manager.stop_flag = True
-                    manager.is_running = False  # Force stop
-                    await manager.broadcast({"type": "status", "message": "🛑 Stop requested - saving leads and closing browser..."})
-                    
-                    # Save all leads in buffer before stopping
-                    if manager.all_leads_buffer and manager.current_session_id:
-                        try:
-                            saved_count = save_leads(manager.current_session_id, manager.all_leads_buffer, replace=True)
-                            await manager.broadcast({
-                                "type": "status",
-                                "message": f"💾 Saved {saved_count} leads to database before stopping",
-                            })
-                        except Exception as e:
-                            await manager.broadcast({
-                                "type": "status",
-                                "message": f"⚠️ Error saving leads on stop: {str(e)[:60]}",
-                            })
-                    
-                    # Close Playwright immediately so the visible browser window exits (run_automation may still unwind)
+                    manager.is_running = False
+                    await manager.broadcast({"type": "status", "message": "🛑 Stopping — cancelling active query..."})
+
+                    # Cancel the running task immediately.  This raises CancelledError at the
+                    # next `await` inside run_automation (page.goto, asyncio.sleep, etc.) so
+                    # the browser stops making requests right away instead of finishing the
+                    # current page load.
+                    task = getattr(manager, "_current_task", None)
+                    if task and not task.done():
+                        task.cancel()
+                        manager._current_task = None
+
+                    # Close Playwright so the visible browser window exits immediately
                     pw_errs = await manager.shutdown_playwright()
                     if pw_errs:
                         await manager.broadcast({
@@ -2699,15 +2696,31 @@ async def websocket_endpoint(websocket: WebSocket):
                     else:
                         await manager.broadcast({"type": "status", "message": "🔚 Browser closed"})
 
-                    # Force completion signal with all leads collected so far
-                    try:
-                        await manager.broadcast({
-                            "type": "complete",
-                            "data": manager.all_leads_buffer if manager.all_leads_buffer else [],
-                        })
-                        manager._completion_sent = True  # prevent finally block duplicate
-                    except Exception:
-                        pass
+                    # Save all leads collected so far
+                    if manager.all_leads_buffer and manager.current_session_id:
+                        try:
+                            saved_count = save_leads(manager.current_session_id, manager.all_leads_buffer, replace=True)
+                            await manager.broadcast({
+                                "type": "status",
+                                "message": f"💾 Saved {saved_count} leads to database",
+                            })
+                        except Exception as e:
+                            await manager.broadcast({
+                                "type": "status",
+                                "message": f"⚠️ Error saving leads on stop: {str(e)[:60]}",
+                            })
+
+                    # Force completion signal (the cancelled task's finally block won't send
+                    # another because _completion_sent is set here first)
+                    if not manager._completion_sent:
+                        try:
+                            await manager.broadcast({
+                                "type": "complete",
+                                "data": manager.all_leads_buffer if manager.all_leads_buffer else [],
+                            })
+                            manager._completion_sent = True
+                        except Exception:
+                            pass
                     
             except Exception as e:
                 # Log error but keep connection alive
